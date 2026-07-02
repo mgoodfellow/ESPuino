@@ -152,6 +152,13 @@ static void RfidMfrc522_TaskImpl(Reader &reader) {
 
 			if (gPlayProperties.pauseIfRfidRemoved) {
 				// https://github.com/miguelbalboa/rfid/issues/188; voodoo! :-)
+				// Readers (clones especially) occasionally miss a single presence
+				// poll of a perfectly stationary card, which used to pause/resume
+				// playback in a rapid flap. Only treat the card as removed after
+				// several consecutive misses; a real removal still reacts within
+				// ~150ms, an isolated miss is absorbed silently.
+				constexpr uint8_t removalDebounceCycles = 3;
+				uint8_t consecutiveMisses = 0;
 				while (true) {
 					if (RFID_SCAN_INTERVAL / 2 >= 20) {
 						vTaskDelay(portTICK_PERIOD_MS * (RFID_SCAN_INTERVAL / 2));
@@ -174,8 +181,12 @@ static void RfidMfrc522_TaskImpl(Reader &reader) {
 
 					if (control == 13 || control == 14) {
 						// card is still there
+						consecutiveMisses = 0;
 					} else {
-						break;
+						consecutiveMisses++;
+						if (consecutiveMisses >= removalDebounceCycles) {
+							break;
+						}
 					}
 				}
 
