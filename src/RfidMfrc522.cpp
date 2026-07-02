@@ -159,7 +159,7 @@ static void RfidMfrc522_TaskImpl(Reader &reader) {
 				// playback in a rapid flap. Only treat the card as removed after
 				// several consecutive misses; a real removal still reacts within
 				// ~150ms, an isolated miss is absorbed silently.
-				constexpr uint8_t removalDebounceCycles = 3;
+				constexpr uint8_t removalDebounceCycles = 8;
 				uint8_t consecutiveMisses = 0;
 				while (true) {
 					if (RFID_SCAN_INTERVAL / 2 >= 20) {
