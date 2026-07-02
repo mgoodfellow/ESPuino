@@ -119,7 +119,13 @@
 			"title": "Delete WiFi",
 			"prompt": "Delete saved WiFi \"{{ssid}}\"?"
 		},
-		"restartPrompt": "Ready to go?"
+		"restartPrompt": "Ready to go?",
+		"fail": {
+			"wrong_password": "Could not join \"{{ssid}}\" — the password is probably wrong (code {{code}}). Please check it and try again.",
+			"not_found": "Network \"{{ssid}}\" was not found (code {{code}}). Is it in range and on 2.4 GHz?",
+			"rejected": "The router refused the connection to \"{{ssid}}\" (code {{code}}). Check MAC filters, client limits or security settings (WPA2 required).",
+			"other": "Connecting to \"{{ssid}}\" failed (code {{code}})."
+		}
 	},
 	"control": {
 		"title": "Control",
