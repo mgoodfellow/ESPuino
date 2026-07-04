@@ -77,6 +77,7 @@ void RfidMfrc522_TaskReset(void) {
 template <typename Reader>
 static void RfidMfrc522_TaskImpl(Reader &reader) {
 	uint8_t control = 0x00;
+	byte lastValidcardId[cardIdSize] = {0}; // must outlive loop iterations: "same card reapplied" is decided by comparing against it
 
 	for (;;) {
 		if (RFID_SCAN_INTERVAL / 2 >= 20) {
@@ -86,7 +87,6 @@ static void RfidMfrc522_TaskImpl(Reader &reader) {
 		}
 		byte cardId[cardIdSize];
 		String cardIdString;
-		byte lastValidcardId[cardIdSize];
 		bool sameCardReapplied = false;
 		if ((millis() - Rfid_LastRfidCheckTimestamp) >= RFID_SCAN_INTERVAL) {
 			// Log_Printf(LOGLEVEL_DEBUG, "%u", uxTaskGetStackHighWaterMark(NULL));
