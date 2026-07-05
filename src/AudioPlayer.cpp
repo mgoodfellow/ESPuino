@@ -352,8 +352,10 @@ void AudioPlayer_Init(void) {
 		Log_Println(wroteMaxLoudnessForHeadphoneToNvs, LOGLEVEL_ERROR);
 	}
 #endif
+	Log_Println("BOOT-CHK A: volume restores done", LOGLEVEL_NOTICE); // TEMP boot-hang debug
 	// Adjust volume depending on headphone is connected and volume-adjustment is enabled
 	AudioPlayer_SetupVolumeAndAmps();
+	Log_Println("BOOT-CHK B: SetupVolumeAndAmps done", LOGLEVEL_NOTICE); // TEMP boot-hang debug
 
 	// initialize gPlayProperties
 	gPlayProperties = {};
@@ -368,6 +370,7 @@ void AudioPlayer_Init(void) {
 	gPlayProperties.coverFilePos = 0;
 	AudioPlayer_StationLogoUrl = "";
 	gPlayProperties.playlist = allocatePlaylist();
+	Log_Println("BOOT-CHK C: playlist allocated", LOGLEVEL_NOTICE); // TEMP boot-hang debug
 	gPlayProperties.SavePlayPosRfidChange = gPrefsSettings.getBool("savePosRfidChge", false); // SAVE_PLAYPOS_WHEN_RFID_CHANGE
 	gPlayProperties.pauseOnMinVolume = gPrefsSettings.getBool("pauseOnMinVol", false); // PAUSE_ON_MIN_VOLUME
 #ifdef PAUSE_WHEN_RFID_REMOVED
@@ -395,6 +398,7 @@ void AudioPlayer_Init(void) {
 	audio->setI2SCommFMT_LSB(true);
 #endif
 
+	Log_Println("BOOT-CHK D: play-properties loaded", LOGLEVEL_NOTICE); // TEMP boot-hang debug
 	AudioPlayer_CurrentVolume = AudioPlayer_GetInitVolume();
 	// DMA-settings must be adjusted before setting the pinout
 	if (System_GetOperationMode() == OPMODE_BLUETOOTH_SOURCE) {
@@ -407,6 +411,7 @@ void AudioPlayer_Init(void) {
 	}
 
 	audio->setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+	Log_Println("BOOT-CHK E: i2s pinout set", LOGLEVEL_NOTICE); // TEMP boot-hang debug
 	audio->setVolumeSteps(AUDIOPLAYER_VOLUME_MAX);
 	audio->setVolumeCurve(Audio_GetVolume);
 	audio->setVolume(AudioPlayer_CurrentVolume);
@@ -415,8 +420,10 @@ void AudioPlayer_Init(void) {
 		gPrefsSettings.getChar("gainLowPass", 0),
 		gPrefsSettings.getChar("gainBandPass", 0),
 		gPrefsSettings.getChar("gainHighPass", 0));
+	Log_Println("BOOT-CHK F: volume/tone applied", LOGLEVEL_NOTICE); // TEMP boot-hang debug
 
 	audio->setAudioTaskCore(1);
+	Log_Println("BOOT-CHK G: audio task core set", LOGLEVEL_NOTICE); // TEMP boot-hang debug
 	audio->audio_info_callback = Audio_InfoCallback;
 }
 
