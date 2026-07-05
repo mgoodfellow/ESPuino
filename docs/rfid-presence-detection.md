@@ -106,6 +106,27 @@ These are hardware/tuning, in rough order of effort-to-payoff:
    is the reliable choice for continuous-presence use; several Tonuino/Toniebox-style
    builds moved to it for exactly this reason.
 
+## Live test results (2026-07-05, ESP32-S3 + RC522 clone, SPI, version reg 0x82)
+
+Bench-tested for ~2 h on real hardware in `pauseIfRfidRemoved` mode with an
+audiobook playlist and multiple Mifare cards:
+
+- **Protocol fix confirmed.** No pause/resume flapping while a card sits
+  stationary on the reader; verified stretches of 38+ s continuous presence
+  with playback progressing. Genuine removals are detected in 100–400 ms
+  (2-cycle debounce) — down from the 400 ms+ the old 8-cycle debounce needed
+  just to stay stable.
+- **Secondary avenue #1 (antenna gain) also confirmed.** With the default
+  `mfrc522Gain` (7 = 48 dB max), a card lying *directly on* the reader coil
+  got a phantom removal 100–400 ms after every detect (receiver saturation) —
+  log signature: `RFID-tag removed` → immediate pause at position 0. The same
+  card at ~3 cm was rock solid. Setting `mfrc522Gain = 5` fixed contact
+  distance completely. Reminder: the pref is only read in `RfidMfrc522_Init`,
+  so it needs a reboot to apply.
+- Side effect worth knowing: with max gain those phantom removals paused
+  playback instantly after a card was applied, which presents as "the box
+  doesn't start playing" — an audio-looking symptom whose actual cause is RF.
+
 ## Optional hardening (not yet done)
 
 `WUPA` confirms *a* card is present, not that it's the *same* UID — a card swapped
