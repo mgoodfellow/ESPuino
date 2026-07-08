@@ -199,6 +199,15 @@ void Cmd_Action(const uint16_t mod) {
 			break;
 		}
 
+		case CMD_RESET_WIFI: {
+			Wlan_DeleteAllNetworks();
+			System_IndicateOk();
+			delay(1500); // give the LED-animation time to be seen before restarting
+			System_SetOperationMode(OPMODE_NORMAL); // escape from BT-mode (restarts by itself in that case), otherwise WiFi stays off after the restart and the access-point can't open
+			System_Restart();
+			break;
+		}
+
 #ifdef BLUETOOTH_ENABLE
 		case CMD_TOGGLE_BLUETOOTH_SINK_MODE: {
 			if (System_GetOperationModeFromNvs() == OPMODE_NORMAL) {

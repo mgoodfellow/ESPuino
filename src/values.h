@@ -51,6 +51,7 @@
 #define CMD_REPEAT_TRACK				 111 // Changes active playmode to endless-loop (for a single track)
 #define CMD_DIMM_LEDS_NIGHTMODE			 120 // Changes LED-brightness
 #define CMD_TOGGLE_WIFI_STATUS			 130 // Toggles WiFi-status
+#define CMD_RESET_WIFI					 131 // Deletes all stored WiFi-networks and restarts; ESPuino then opens its access-point for re-configuration
 #define CMD_TOGGLE_BLUETOOTH_SINK_MODE	 140 // Toggles Normal/Bluetooth sink Mode
 #define CMD_TOGGLE_BLUETOOTH_SOURCE_MODE 141 // Toggles Normal/Bluetooth source Mode
 #define CMD_TOGGLE_MODE					 142 // Toggles Normal => Bluetooth sink => Bluetooth source => Normal Mode

@@ -757,6 +757,15 @@ bool Wlan_DeleteNetwork(String ssid) {
 	return entry.has_value();
 }
 
+// Deletes all saved networks so the access-point opens for re-configuration after the next restart
+void Wlan_DeleteAllNetworks(void) {
+	Log_Println(wifiDeleteAllNetworks, LOGLEVEL_NOTICE);
+	prefsWifiSettings.clear();
+	gPrefsSettings.remove("LAST_SSID");
+	// WiFi must not stay disabled, otherwise the access-point won't open after the restart
+	gPrefsSettings.putUInt("enableWifi", 1);
+}
+
 bool Wlan_ConnectionTryInProgress(void) {
 	return wifiState == WIFI_STATE_SCAN_CONN;
 }

@@ -225,6 +225,7 @@ extern const char wifiCurrentIp[];
 extern const char jsonErrorMsg[];
 extern const char jsonbufferOverflow[];
 extern const char wifiDeleteNetwork[];
+extern const char wifiDeleteAllNetworks[];
 extern const char wifiAddTooManyNetworks[];
 extern const char wifiAddNetwork[];
 extern const char wifiUpdateNetwork[];

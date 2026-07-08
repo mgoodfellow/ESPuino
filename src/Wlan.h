@@ -116,6 +116,7 @@ const String Wlan_GetCurrentSSID();
 const String Wlan_GetHostname();
 const String Wlan_GetMacAddress();
 bool Wlan_DeleteNetwork(String);
+void Wlan_DeleteAllNetworks(void);
 bool Wlan_ValidateHostname(String);
 bool Wlan_SetHostname(String);
 const String Wlan_GetApSSID(void);

@@ -240,13 +240,40 @@ static const struct {
 	{4, 5, "btnMulti45", BUTTON_MULTI_45},
 };
 
+// Destructive actions don't fire immediately, but only after the combo was held for this long (kid-proofing)
+#ifndef INTERVAL_TO_HOLD_DESTRUCTIVE_COMMAND
+	#define INTERVAL_TO_HOLD_DESTRUCTIVE_COMMAND 5000
+#endif
+
+// Commands that wipe data must survive a deliberate long-hold before they fire
+static bool Button_CommandRequiresHold(uint8_t cmd) {
+	return cmd == CMD_RESET_WIFI;
+}
+
 // Check for multi-button combinations and execute corresponding action
 static bool Button_HandleMultiButtonPress(void) {
 	for (const auto &combo : multiButtonCombos) {
 		if (gButtons[combo.btn1].isPressed && gButtons[combo.btn2].isPressed) {
+			const uint8_t cmd = gPrefsSettings.getUChar(combo.prefsKey, combo.defaultCmd);
+			if (Button_CommandRequiresHold(cmd)) {
+				const bool bothStillDown = !gButtons[combo.btn1].currentState && !gButtons[combo.btn2].currentState;
+				const unsigned long heldSince = max(gButtons[combo.btn1].firstPressedTimestamp, gButtons[combo.btn2].firstPressedTimestamp);
+				if (bothStillDown && (millis() - heldSince) < INTERVAL_TO_HOLD_DESTRUCTIVE_COMMAND) {
+					// keep waiting; block single-button actions while the combo is held
+					return true;
+				}
+				gButtons[combo.btn1].isPressed = false;
+				gButtons[combo.btn2].isPressed = false;
+				if (!bothStillDown) {
+					// combo was released before the hold-interval elapsed: swallow the presses, do nothing
+					return true;
+				}
+				Cmd_Action(cmd);
+				return true;
+			}
 			gButtons[combo.btn1].isPressed = false;
 			gButtons[combo.btn2].isPressed = false;
-			Cmd_Action(gPrefsSettings.getUChar(combo.prefsKey, combo.defaultCmd));
+			Cmd_Action(cmd);
 			return true;
 		}
 	}
