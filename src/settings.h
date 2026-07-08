@@ -110,6 +110,10 @@
 		To all of those buttons, an action can be assigned freely.
 		Please have a look at values.h to look up actions available (>=100 can be used)
 		If you don't want to assign an action or you don't use a given button: CMD_NOTHING has to be set
+
+	Note: destructive actions (CMD_RESET_WIFI: deletes all saved WiFi-networks!) only fire after the
+		multi-button-combo was held for 5s (kid-proofing). The hold-interval can be changed via
+		#define INTERVAL_TO_HOLD_DESTRUCTIVE_COMMAND (in ms).
 	*/
 	// *****BUTTON*****        *****ACTION*****
 	#define BUTTON_0_SHORT    CMD_NEXTTRACK

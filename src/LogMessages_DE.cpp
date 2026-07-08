@@ -227,6 +227,7 @@ const char wifiCurrentIp[] = "Aktuelle IP: %s";
 const char jsonErrorMsg[] = "deserializeJson() fehlgeschlagen: %s";
 const char jsonbufferOverflow[] = "JSON-Puffer zu klein für Daten";
 const char wifiDeleteNetwork[] = "Lösche gespeichertes WLAN %s";
+const char wifiDeleteAllNetworks[] = "Lösche alle gespeicherten WLANs; Neustart in den Access-Point zur Neukonfiguration";
 const char wifiAddTooManyNetworks[] = "Kein Platz, weiteres WLAN zu speichern!";
 const char wifiAddNetwork[] = "Füge WLAN hinzu: %s";
 const char wifiUpdateNetwork[] = "Ändere Passwort für WLAN %s";

@@ -17,6 +17,7 @@
 * 10.07.2026: Fix stack buffer overflow in RfidPn5180_WakeupCheck() when formatting the card UID for NVS lookup (#421)
 * 10.07.2026: Fix intermittent boot-hang with PN5180-LPCD enabled by deferring RFID-task start until after peripheral init (#420)
 * 09.07.2026: Remove unmaintained MAX17055 fuel-gauge support (MEASURE_BATTERY_MAX17055). Voltage-based battery measurement (MEASURE_BATTERY_VOLTAGE) is unaffected. (#419)
+* 08.07.2026: New command CMD_RESET_WIFI: forget all saved WiFi-networks + restart into access-point for re-configuration (e.g. when gifting a box). Assignable to buttons, modification-cards and web-UI; via multi-button-combo it only fires after a 5s hold (#38)
 * 08.07.2026: Fix DONT_ACCEPT_SAME_RFID_TWICE / PLAY_LAST_RFID_AFTER_REBOOT in combination with WiFi not yet available
 * 25.06.2026: update some libaries and platform (#411), thanks to @Joe91
 * 19.06.2026: Feature: ResumeOnSameRFID (#398), thanks to @joker-mik
