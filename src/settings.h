@@ -55,11 +55,6 @@
 	//#define RESUME_ON_SAME_RFID          // If playback is paused and the same RFID is detected again, playback resumes (only in combination with DONT_ACCEPT_SAME_RFID_TWICE)
 	//#define HALLEFFECT_SENSOR_ENABLE      // Support for hallsensor. For fine-tuning please adjust HallEffectSensor.h Please note: only user-support provided (https://forum.espuino.de/t/magnetische-hockey-tags/1449/35)
 
-	//################## set PAUSE_WHEN_RFID_REMOVED behaviour #############################
-	#ifdef PAUSE_WHEN_RFID_REMOVED
-		#define ACCEPT_SAME_RFID_AFTER_TRACK_END           // Accepts same RFID after playback has ended (https://forum.espuino.de/t/neues-feature-pausieren-wenn-rfid-karte-entfernt-wurde/541/2)
-	#endif
-
 	//################## select SD card mode #############################
 	#define SD_MMC_1BIT_MODE              // run SD card in SD-MMC 1Bit mode (using GPIOs 15 + 14 + 2 is mandatory!)
 	//#define SINGLE_SPI_ENABLE             // If only one SPI-instance should be used instead of two (not yet working!)
