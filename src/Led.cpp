@@ -410,7 +410,12 @@ static void Led_Task(void *parameter) {
 	indicator = new CRGBSet(leds, numIndicatorLeds);
 	// initialize FastLED
 	FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, numIndicatorLeds + numControlLeds).setCorrection(TypicalSMD5050);
-	FastLED.setBrightness(gLedSettings.Led_Brightness);
+	// Perceptual dimming: a WS2812's light output is ~linear in its 8-bit value but the eye is
+	// ~logarithmic, so a linear brightness barely dims until the very bottom of the range and
+	// otherwise just looks "bright". Map the brightness through FastLED's dim8_video() (a ~gamma-2
+	// curve that keeps a set value visible) so perceived brightness tracks the setting. It scales
+	// the global brightness, not the per-pixel colours, so hues are not shifted.
+	FastLED.setBrightness(dim8_video(gLedSettings.Led_Brightness));
 	FastLED.setDither(DISABLE_DITHER);
 	FastLED.setMaxRefreshRate(200); // limit LED refresh rate to 200Hz (less likely to cause flickering)
 
@@ -507,7 +512,7 @@ static void Led_Task(void *parameter) {
 
 		// apply brightness-changes
 		if (lastLedBrightness != gLedSettings.Led_Brightness) {
-			FastLED.setBrightness(gLedSettings.Led_Brightness);
+			FastLED.setBrightness(dim8_video(gLedSettings.Led_Brightness)); // perceptual dimming (see Led_Init)
 			lastLedBrightness = gLedSettings.Led_Brightness;
 		}
 
