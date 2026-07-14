@@ -1776,6 +1776,12 @@
 									<i class="fas fa-hourglass-end fa-2x .icon-pos"></i>
 								</div>
 							</div>
+							<label for="sleepTracks" data-i18n="general.sleep.tracks"></label>
+							<a href="#" class="link-secondary" data-bs-toggle="popover"
+								data-i18n="[data-bs-content]general.sleep.tracksExp" tabindex="0"><i
+									class="fas fa-circle-question"></i></a>
+							<input type="number" min="1" max="99" class="form-control" id="sleepTracks"
+								name="sleepTracks" value="" required>
 						</fieldset>
 					</div>
 					<hr>
@@ -3252,6 +3258,7 @@
 				$('#maxVolumeSpeaker').bootstrapSlider('setValue', genSettings.maxVolumeSp);
 				$('#maxVolumeHeadphone').bootstrapSlider('setValue', genSettings.maxVolumeHp);
 				$('#inactivityTime').bootstrapSlider('setValue', genSettings.sleepInactivity);
+				$('#sleepTracks').val(genSettings.sleepTracks);
 				$('#playMono').prop('checked', genSettings.playMono);
 				$('#savePlayPosShutdown').prop('checked', genSettings.savePosShutdown);
 				$('#savePlayPosRfidChange').prop('checked', genSettings.savePosRfidChge);
@@ -3724,6 +3731,7 @@
 					maxVolumeSp: Number($('#maxVolumeSpeaker').val()),
 					maxVolumeHp: Number($('#maxVolumeHeadphone').val()),
 					sleepInactivity: Number($('#inactivityTime').val()),
+					sleepTracks: Number($('#sleepTracks').val()),
 					playMono: $('#playMono').prop('checked'),
 					savePosShutdown: $('#savePlayPosShutdown').prop('checked'),
 					savePosRfidChge: $('#savePlayPosRfidChange').prop('checked'),
@@ -4516,7 +4524,7 @@
 
 			/* The <select /> that houses all commands for the modification selectors */
 			const modElem = document.createElement('select');
-			const mods = [100, 179, 101, 102, 103, 104, 105, 106, 110, 111, 120, 130, 140, 141, 142, 150, 151, 152, 153, 0, 170, 171, 172, 173, 174, 184, 185, 180, 181, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250];
+			const mods = [100, 179, 101, 102, 103, 104, 105, 106, 107, 110, 111, 120, 130, 140, 141, 142, 150, 151, 152, 153, 0, 170, 171, 172, 173, 174, 184, 185, 180, 181, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250];
 			for (const mod of mods) {
 				const opt = addOption(modElem, mod);
 				if ([140, 141, 142].includes(mod)) {
