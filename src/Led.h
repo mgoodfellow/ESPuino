@@ -60,6 +60,8 @@ struct AnimationReturnType {
 
 #ifdef NEOPIXEL_ENABLE
 	#define LED_INITIAL_BRIGHTNESS		 16u
+	#define LED_BRIGHTNESS_STEP			 4u // Brightness change per rotary detent (CMD_BRIGHTNESS_UP/DOWN)
+	#define LED_BRIGHTNESS_MIN			 1u // Never let a gesture turn the LEDs fully off -- that looks like a crash
 	#define LED_INITIAL_NIGHT_BRIGHTNESS 2u
 
 	// FastLED's clockless-SPI WS2812 driver claims the FSPI host, which on
