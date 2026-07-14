@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include "settings.h"
 
+#include <atomic>
+
 #include "AudioPlayer.h"
 #include "Cmd.h"
 #include "Common.h"
@@ -109,6 +111,28 @@ void Rfid_PreferenceLookupHandler(void) {
 
 void Rfid_ResetOldRfid() {
 	strncpy(gOldRfidTagId, "X", cardIdStringSize - 1);
+}
+
+// Set by Rfid_ResetLastTag(), consumed by the reader task. The reader's "same card re-applied"
+// buffer is task-local, so it can only be cleared from within the task itself.
+static std::atomic<bool> gResetLastTagRequested {false};
+
+// Forget the tag that was last seen/accepted, in both places that remember it: gOldRfidTagId (the
+// dontAcceptRfidTwice dedup) and the reader task's own last-card buffer (the pauseIfRfidRemoved dedup).
+// Call this whenever something *other than the reader* changes what a tag means -- an assignment being
+// written, deleted or restored, or playback being started from the web UI.
+//
+// Without this, re-applying a tag whose assignment just changed is short-circuited before the NVS lookup
+// ever happens: in pauseIfRfidRemoved-mode the reader turns it into a play/pause toggle on the playlist
+// that is still loaded, so the *old* book resumes. Both dedups live only in RAM, which is why a reboot or
+// a deep-sleep cycle appears to "fix" it.
+void Rfid_ResetLastTag() {
+	Rfid_ResetOldRfid();
+	gResetLastTagRequested.store(true, std::memory_order_relaxed);
+}
+
+bool Rfid_ConsumeLastTagReset() {
+	return gResetLastTagRequested.exchange(false, std::memory_order_relaxed);
 }
 
 #if defined(RFID_READER_TYPE_RUNTIME)
