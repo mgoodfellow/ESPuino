@@ -263,6 +263,18 @@ static void RfidMfrc522_TaskImpl(Reader &reader) {
 				}
 				reader.PICC_HaltA();
 				reader.PCD_StopCrypto1();
+
+				// A card is only re-detected by the loop above via PICC_IsNewCardPresent(),
+				// which sends REQA (0x26) -- and REQA is ignored by cards in the HALT state.
+				// Every card we have seen is parked in HALT by the presence poll, so if the
+				// removal was spurious (one noisy poll, card never actually left) the card
+				// sits halted in a live field and REQA can never see it again: playback
+				// stays paused until the user physically lifts and re-applies the card.
+				// Drop the field briefly so any card still on the antenna loses power and
+				// powers back up in IDLE, where REQA finds it.
+				reader.PCD_AntennaOff();
+				vTaskDelay(portTICK_PERIOD_MS * 10);
+				reader.PCD_AntennaOn();
 			}
 		}
 	}
