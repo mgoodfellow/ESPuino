@@ -223,10 +223,16 @@ static void RfidMfrc522_TaskImpl(Reader &reader) {
 				// dropped poll (RF noise) without the old REQA "voodoo". Set to 1 to
 				// test raw WUPA reliability with zero tolerance for a missed poll.
 				constexpr uint8_t removalDebounceCycles = 2;
+				// Backstop for the "errors instead of timeouts" case; long enough that a noise
+				// burst over a resting card never trips it, short enough that a real removal
+				// masked by noise is still noticed quickly.
+				constexpr uint32_t noAnswerTimeoutMs = 1500;
 				uint8_t consecutiveMisses = 0;
 				uint32_t pollCount = 0;
 				uint32_t okCount = 0;
+				uint32_t noiseCount = 0;
 				const uint32_t pollStart = millis();
+				uint32_t lastAnswerAt = millis();
 				while (true) {
 					if (rfidScanInterval / 2 >= 20) {
 						vTaskDelay(portTICK_PERIOD_MS * (rfidScanInterval / 2));
@@ -241,17 +247,29 @@ static void RfidMfrc522_TaskImpl(Reader &reader) {
 							Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: recovered after %u miss(es) [poll=%u ok=%u]", consecutiveMisses, pollCount, okCount);
 						}
 						consecutiveMisses = 0;
-					} else {
-						// status codes: 0=OK 1=ERROR 2=COLLISION 3=TIMEOUT 4=NO_ROOM
-						//               5=INTERNAL_ERROR 6=INVALID 7=CRC_WRONG 255=MIFARE_NACK
-						const uint8_t reqaStatus = RfidMfrc522_ProbeReqa(reader);
-						Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: miss %u/%u wupa=%u reqa=%u [poll=%u ok=%u t=%ums]", consecutiveMisses + 1, removalDebounceCycles, wupaStatus, reqaStatus, pollCount, okCount, millis() - pollStart);
-						if (++consecutiveMisses >= removalDebounceCycles) {
-							break;
-						}
+						lastAnswerAt = millis();
+					} else if (wupaStatus != static_cast<uint8_t>(Reader::STATUS_TIMEOUT)) {
+						// Something answered and the frame was mangled (parity/protocol/CRC error
+						// out of the MFRC522's ErrorReg) -- that is evidence the card is STILL
+						// THERE, not that it left: an empty field produces a clean timeout, since
+						// there is nobody to reply at all. Counting these as misses is what makes
+						// a card in an electrically noisy spot pause every few seconds. Ignore
+						// them, but keep the staleness watchdog below honest.
+						noiseCount++;
+						Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: noise (status=%u) ignored [poll=%u ok=%u noise=%u]", wupaStatus, pollCount, okCount, noiseCount);
+					} else if (++consecutiveMisses >= removalDebounceCycles) {
+						break;
+					}
+
+					// Watchdog: if nothing has answered cleanly for a while -- e.g. the card was
+					// lifted during a noise burst, so we keep seeing errors instead of timeouts --
+					// declare removal anyway rather than polling a card that is long gone.
+					if ((millis() - lastAnswerAt) >= noAnswerTimeoutMs) {
+						Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: no clean answer for %ums -- treating as removed", millis() - lastAnswerAt);
+						break;
 					}
 				}
-				Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: removal declared -- %u polls, %u ok, held %ums", pollCount, okCount, millis() - pollStart);
+				Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: removal declared -- %u polls, %u ok, %u noise, held %ums", pollCount, okCount, noiseCount, millis() - pollStart);
 
 				Log_Println(rfidTagRemoved, LOGLEVEL_NOTICE);
 				// Only pause if there's actually something to pause -- otherwise removing a card after the
