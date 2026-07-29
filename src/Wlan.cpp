@@ -52,6 +52,38 @@ static uint8_t connectionAttemptCounter = 0;
 static unsigned long connectStartTimestamp = 0;
 static uint32_t connectionFailedTimestamp = 0;
 
+// diagnostics of the running/last connection attempt. The state machine only
+// polls WiFi.status(), which never surfaces WHY an attempt failed — the 802.11
+// reason code (wrong password vs. network not found vs. AP refused) only
+// arrives via the disconnect event. Captured here and persisted to NVS on
+// failure so the accesspoint page can show it to the user, even after the
+// reboot that sits between entering credentials and reading the result.
+static volatile uint8_t lastDisconnectReason = 0;
+static String lastAttemptSsid;
+static constexpr const char *nvsFailSsidKey = "wifiFailSsid";
+static constexpr const char *nvsFailReasonKey = "wifiFailReason";
+
+// Live connection test, runnable while the setup AP stays up (WIFI_AP_STA):
+// the accesspoint page saves credentials, POSTs /wifitest and then polls
+// /wifistatus — so the user gets immediate feedback (wrong password, no IP,
+// success + IP) instead of the old save → reboot → hope flow.
+enum class WifiTestPhase : uint8_t {
+	Idle = 0,
+	Pending, // requested by the web handler, not yet started
+	Connecting,
+	Success,
+	Failed
+};
+static volatile WifiTestPhase testPhase = WifiTestPhase::Idle;
+static WiFiSettings testSettings;
+static uint8_t testFailReason = 0;
+static uint32_t testStartTimestamp = 0;
+static uint32_t testSuccessTimestamp = 0;
+// how long a test attempt may take before it is declared failed (assoc + DHCP)
+static constexpr uint32_t testTimeout = 25000;
+// how long the result stays visible on the AP before switching to normal mode
+static constexpr uint32_t testSuccessLinger = 15000;
+
 // state for persistent settings
 static constexpr const char *nvsWiFiNamespace = "wifi-settings";
 static constexpr const char *nvsWiFiKey = "wifi-";
@@ -185,10 +217,6 @@ static void migrateFromVersion1() {
 		entry.ssid = std::move(strSSID);
 		entry.password = std::move(strPassword);
 
-#ifdef STATIC_IP_ENABLE
-		entry.staticIp = WiFiSettings::StaticIp(IPAddress(LOCAL_IP), IPAddress(SUBNET_IP), IPAddress(GATEWAY_IP), IPAddress(DNS_IP));
-#endif
-
 		Wlan_AddNetworkSettings(entry);
 		// clean up old values from nvs
 		gPrefsSettings.remove("SSID");
@@ -242,7 +270,11 @@ static void migrateFromVersion2() {
 }
 
 void Wlan_Init(void) {
-	prefsWifiSettings.begin(nvsWiFiNamespace);
+	if (!prefsWifiSettings.begin(nvsWiFiNamespace)) {
+		// Otherwise silent: later getX() calls on this namespace would just return their default
+		// parameter, indistinguishable from the key legitimately not existing yet.
+		Log_Println("Failed to open NVS namespace 'wifi-settings'", LOGLEVEL_ERROR);
+	}
 
 	wifiEnabled = getWifiEnableStatusFromNVS();
 
@@ -287,6 +319,20 @@ void Wlan_Init(void) {
 	// for Arduino 2.0.9 this does not seem to bring any advantage just more memory use, so leave it outcommented
 	// WiFi.useStaticBuffers(true);
 
+	// capture the reason code of station disconnects (see lastDisconnectReason)
+	WiFi.onEvent([](WiFiEvent_t event, arduino_event_info_t info) {
+		const uint8_t reason = info.wifi_sta_disconnected.reason;
+		// The connect state machine tears down its own attempts (WiFi.disconnect()
+		// before every retry), which raises ASSOC_LEAVE/AUTH_LEAVE. Recording those
+		// would overwrite the reason we actually want — the one the AP gave when the
+		// attempt failed — so keep the last meaningful code instead.
+		if (reason == WIFI_REASON_ASSOC_LEAVE || reason == WIFI_REASON_AUTH_LEAVE) {
+			return;
+		}
+		lastDisconnectReason = reason;
+	},
+		WiFiEvent_t::ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
 	wifiState = WIFI_STATE_INIT;
 	handleWifiStateInit();
 }
@@ -307,6 +353,8 @@ void connectToKnownNetwork(const WiFiSettings &settings, const uint8_t *bssid = 
 
 	Log_Printf(LOGLEVEL_NOTICE, wifiConnectionInProgress, settings.ssid.c_str());
 
+	lastAttemptSsid = settings.ssid;
+	lastDisconnectReason = 0;
 	WiFi.begin(settings.ssid, settings.password, 0, bssid);
 }
 
@@ -496,7 +544,7 @@ void handleWifiStateConnectionSuccess() {
 	dnsServer = nullptr;
 
 	// A webstream-tag applied while WiFi was not yet connected (e.g. right after boot, or restored via
-	// PLAY_LAST_RFID_AFTER_REBOOT) could not be started. Now that WiFi is up, re-inject that tag into the
+	// the "play last RFID after reboot" setting) could not be started. Now that WiFi is up, re-inject that tag into the
 	// RFID-queue so playback starts. Only do so if nothing else is playing meanwhile - the user may have
 	// applied another tag in the meantime, which must not be overridden.
 	if (gRetryRfidOnWifiConnect) {
@@ -508,6 +556,12 @@ void handleWifiStateConnectionSuccess() {
 				Log_Println(retryRfidQueueFull, LOGLEVEL_ERROR);
 			}
 		}
+	}
+
+	// a successful connection invalidates the stored failure diagnostics
+	if (gPrefsSettings.isKey(nvsFailReasonKey)) {
+		gPrefsSettings.remove(nvsFailReasonKey);
+		gPrefsSettings.remove(nvsFailSsidKey);
 	}
 
 	wifiState = WIFI_STATE_CONNECTED;
@@ -556,6 +610,20 @@ void handleWifiStateConnectionFailed() {
 	if (connectionFailedTimestamp == 0) {
 		Log_Println(cantConnectToWifi, LOGLEVEL_INFO);
 		connectionFailedTimestamp = millis();
+
+		// persist the failure diagnostics for the accesspoint page. If no
+		// connect was even attempted, none of the saved networks was in the
+		// scan results — report that as NO_AP_FOUND for the last known SSID.
+		if (lastAttemptSsid.length() && lastDisconnectReason != 0) {
+			gPrefsSettings.putString(nvsFailSsidKey, lastAttemptSsid);
+			gPrefsSettings.putUChar(nvsFailReasonKey, lastDisconnectReason);
+		} else if (!lastAttemptSsid.length()) {
+			const String lastSSID = gPrefsSettings.getString("LAST_SSID");
+			if (lastSSID.length()) {
+				gPrefsSettings.putString(nvsFailSsidKey, lastSSID);
+				gPrefsSettings.putUChar(nvsFailReasonKey, WIFI_REASON_NO_AP_FOUND);
+			}
+		}
 	}
 
 	if (initialStart) {
@@ -581,6 +649,57 @@ void handleWifiStateAP() {
 		WiFi.mode(WIFI_OFF);
 		wifiState = WIFI_STATE_DISCONNECTED;
 		return;
+	}
+
+	switch (testPhase) {
+		case WifiTestPhase::Pending:
+			// bring the station interface up next to the AP and try the
+			// credentials. The AP may hop to the target network's channel,
+			// briefly interrupting the portal client — the page just keeps
+			// polling.
+			wifiAPStartedTimestamp = millis(); // user is mid-setup: keep AP alive
+			WiFi.mode(WIFI_AP_STA);
+			connectToKnownNetwork(testSettings);
+			testStartTimestamp = millis();
+			testPhase = WifiTestPhase::Connecting;
+			break;
+		case WifiTestPhase::Connecting:
+			wifiAPStartedTimestamp = millis();
+			if (WiFi.status() == WL_CONNECTED) {
+				testSuccessTimestamp = millis();
+				testPhase = WifiTestPhase::Success;
+				// the credentials work — drop any stale failure diagnostics
+				if (gPrefsSettings.isKey(nvsFailReasonKey)) {
+					gPrefsSettings.remove(nvsFailReasonKey);
+					gPrefsSettings.remove(nvsFailSsidKey);
+				}
+				Log_Printf(LOGLEVEL_NOTICE, "WiFi-test: connected to %s, IP: %s", testSettings.ssid.c_str(), WiFi.localIP().toString().c_str());
+			} else if (millis() - testStartTimestamp > testTimeout) {
+				// reason stays 0 when association worked but no IP arrived
+				testFailReason = lastDisconnectReason;
+				testPhase = WifiTestPhase::Failed;
+				gPrefsSettings.putString(nvsFailSsidKey, testSettings.ssid);
+				gPrefsSettings.putUChar(nvsFailReasonKey, testFailReason);
+				Log_Printf(LOGLEVEL_ERROR, "WiFi-test: failed for %s (reason %u)", testSettings.ssid.c_str(), testFailReason);
+				WiFi.disconnect(true, true);
+				WiFi.mode(WIFI_AP);
+			}
+			break;
+		case WifiTestPhase::Success:
+			wifiAPStartedTimestamp = millis();
+			// leave the result on screen for a moment, then close the AP and
+			// continue as a normally connected station
+			if (millis() - testSuccessTimestamp > testSuccessLinger) {
+				testPhase = WifiTestPhase::Idle;
+				WiFi.softAPdisconnect(false);
+				WiFi.mode(WIFI_STA);
+				wifiState = WIFI_STATE_CONN_SUCCESS;
+				return;
+			}
+			break;
+		default:
+			// Idle: nothing to do; Failed: wait for the user to retry
+			break;
 	}
 
 	dnsServer->processNextRequest();
@@ -759,6 +878,74 @@ bool Wlan_DeleteNetwork(String ssid) {
 
 bool Wlan_ConnectionTryInProgress(void) {
 	return wifiState == WIFI_STATE_SCAN_CONN;
+}
+
+// Coarse connection state for the web API (/wifistatus)
+const char *Wlan_GetConnectState(void) {
+	switch (wifiState) {
+		case WIFI_STATE_CONNECTED:
+			return "connected";
+		case WIFI_STATE_CONN_FAILED:
+			return "failed";
+		case WIFI_STATE_AP:
+			return "ap";
+		case WIFI_STATE_END:
+			return "off";
+		default:
+			return "connecting";
+	}
+}
+
+// Start a live connection test for a saved network while the setup AP is up.
+// Returns false when not in AP mode, a test is already running, or the SSID
+// has no saved settings.
+bool Wlan_StartConnectionTest(const String &ssid) {
+	if (wifiState != WIFI_STATE_AP) {
+		return false;
+	}
+	if (testPhase == WifiTestPhase::Pending || testPhase == WifiTestPhase::Connecting) {
+		return false;
+	}
+	const auto entry = getNvsWifiSettings(ssid);
+	if (!entry) {
+		return false;
+	}
+	testSettings = entry->value;
+	testFailReason = 0;
+	testPhase = WifiTestPhase::Pending; // picked up by handleWifiStateAP()
+	return true;
+}
+
+const char *Wlan_GetTestPhase(void) {
+	switch (testPhase) {
+		case WifiTestPhase::Pending:
+		case WifiTestPhase::Connecting:
+			return "connecting";
+		case WifiTestPhase::Success:
+			return "success";
+		case WifiTestPhase::Failed:
+			return "failed";
+		default:
+			return "idle";
+	}
+}
+
+uint8_t Wlan_GetTestReason(void) {
+	return testFailReason;
+}
+
+const String Wlan_GetTestSsid(void) {
+	return testSettings.ssid;
+}
+
+// Diagnostics of the last failed connection attempt (cleared on success)
+bool Wlan_GetLastFailure(String &ssid, uint8_t &reason) {
+	if (!gPrefsSettings.isKey(nvsFailReasonKey)) {
+		return false;
+	}
+	ssid = gPrefsSettings.getString(nvsFailSsidKey);
+	reason = gPrefsSettings.getUChar(nvsFailReasonKey);
+	return true;
 }
 
 String Wlan_GetIpAddress(void) {

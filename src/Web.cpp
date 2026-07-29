@@ -8,6 +8,7 @@
 #include "AudioPlayer.h"
 #include "Battery.h"
 #include "Bluetooth.h"
+#include "Button.h"
 #include "Cmd.h"
 #include "Common.h"
 #include "ESPAsyncWebServer.h"
@@ -35,6 +36,12 @@
 #include <atomic>
 #include <esp_task_wdt.h>
 #include <nvs.h>
+
+// An override written before this feature existed does not define it (settings-override.h replaces
+// settings.h wholesale), so fall back rather than break those builds.
+#ifndef JUMP_OFFSET_ROTARY
+	#define JUMP_OFFSET_ROTARY 10
+#endif
 
 typedef struct {
 	char nvsKey[cardIdStringSize];
@@ -65,7 +72,12 @@ static std::atomic<bool> uploadAborted = false;
 
 void Web_DumpSdToNvs(const char *_filename);
 static void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
-static void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
+// Raw (non-multipart) request body: one PUT/POST per file, the target path
+// (folder + filename) travels in the "path" query param since a raw body
+// carries no per-part filename. The client is responsible for looping over
+// multiple files sequentially - see the double-buffer/writer-task machinery
+// below, which only supports one upload in flight at a time.
+static void explorerHandleFileUpload(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total);
 static void explorerHandleFileStorageTask(void *parameter);
 static void explorerHandleListRequest(AsyncWebServerRequest *request);
 static void explorerHandleDownloadRequest(AsyncWebServerRequest *request);
@@ -75,6 +87,8 @@ static void explorerHandleRenameRequest(AsyncWebServerRequest *request);
 static void explorerHandleAudioRequest(AsyncWebServerRequest *request);
 static void handleTrackProgressRequest(AsyncWebServerRequest *request);
 static void handleGetSavedSSIDs(AsyncWebServerRequest *request);
+static void handleGetWifiStatus(AsyncWebServerRequest *request);
+static void handlePostWifiTest(AsyncWebServerRequest *request, JsonVariant &json);
 static void handlePostSavedSSIDs(AsyncWebServerRequest *request, JsonVariant &json);
 static void handleDeleteSavedSSIDs(AsyncWebServerRequest *request);
 static void handleGetActiveSSID(AsyncWebServerRequest *request);
@@ -577,6 +591,7 @@ void webserverStart(void) {
 			// make a backup first
 			Web_DumpNvsToSd("rfidTags", backupFile);
 			if (gPrefsRfid.clear()) {
+				Rfid_ResetLastTag(); // Every tag means something else now (namely: nothing)
 				request->send(200);
 			} else {
 				request->send(500);
@@ -606,7 +621,7 @@ void webserverStart(void) {
 					request->send(200);
 				}
 			},
-			explorerHandleFileUpload);
+			NULL, explorerHandleFileUpload);
 
 		wServer.on("/explorerdownload", HTTP_GET, explorerHandleDownloadRequest);
 
@@ -626,6 +641,8 @@ void webserverStart(void) {
 		wServer.addRewrite(new OneParamRewrite("/savedSSIDs/{ssid}", "/savedSSIDs?ssid={ssid}"));
 		wServer.on("/savedSSIDs", HTTP_DELETE, handleDeleteSavedSSIDs);
 		wServer.on("/activeSSID", HTTP_GET, handleGetActiveSSID);
+		wServer.on("/wifistatus", HTTP_GET, handleGetWifiStatus);
+		wServer.addHandler(new AsyncCallbackJsonWebHandler("/wifitest", handlePostWifiTest));
 
 		wServer.on("/wificonfig", HTTP_GET, handleGetWiFiConfig);
 		wServer.addHandler(new AsyncCallbackJsonWebHandler("/wificonfig", handlePostWiFiConfig));
@@ -725,13 +742,31 @@ WebsocketCodeType JSONToSettings(JsonObject doc) {
 	if (doc["general"].is<JsonObject>()) {
 		// general settings
 		JsonObject generalObj = doc["general"];
+		// A minimum volume that is not strictly below both maximums would leave no usable volume range,
+		// so reject it before writing anything. The HTML input already constrains this, but a direct
+		// REST/websocket POST could bypass that.
+		const uint8_t minVolume = generalObj["minVolume"].as<uint8_t>();
+		if (minVolume >= generalObj["maxVolumeSp"].as<uint8_t>() || minVolume >= generalObj["maxVolumeHp"].as<uint8_t>()) {
+			Log_Println(webSaveSettingsVolumeMinMaxError, LOGLEVEL_ERROR);
+			return WebsocketCodeType::Error;
+		}
 		bool success = (gPrefsSettings.putUInt("initVolume", generalObj["initVolume"].as<uint8_t>()) != 0);
+		success = success && (gPrefsSettings.putUInt("minVolume", minVolume) != 0);
 		success = success && (gPrefsSettings.putUInt("maxVolumeSp", generalObj["maxVolumeSp"].as<uint8_t>()) != 0);
 		success = success && (gPrefsSettings.putUInt("maxVolumeHp", generalObj["maxVolumeHp"].as<uint8_t>()) != 0);
 		success = success && (gPrefsSettings.putUInt("mInactiviyT", generalObj["sleepInactivity"].as<uint8_t>()) != 0);
+		if (generalObj["rotSeekStep"].is<uint8_t>()) {
+			success = success && (gPrefsSettings.putUChar("rotSeekStep", generalObj["rotSeekStep"].as<uint8_t>()) != 0);
+		}
 		success = success && (gPrefsSettings.putBool("playMono", generalObj["playMono"].as<bool>()) != 0);
 		success = success && (gPrefsSettings.putBool("savePosShutdown", generalObj["savePosShutdown"].as<bool>()) != 0);
 		success = success && (gPrefsSettings.putBool("savePosRfidChge", generalObj["savePosRfidChge"].as<bool>()) != 0);
+		if (generalObj["savePosInterval"].is<uint16_t>()) {
+			// Guard: an older cached GUI page POSTs this block without the field; without this guard
+			// putUShort would persist a 0 and silently disable a checkpoint interval the user had set.
+			success = success && (gPrefsSettings.putUShort("savePosIntv", generalObj["savePosInterval"].as<uint16_t>()) != 0);
+			gPlayProperties.savePosIntervalSecs = generalObj["savePosInterval"].as<uint16_t>(); // apply live, no reboot needed
+		}
 		success = success && (gPrefsSettings.putBool("playLastOnBoot", generalObj["playLastRfidOnReboot"].as<bool>()) != 0);
 		success = success && (gPrefsSettings.putBool("pauseRfidRem", generalObj["pauseIfRfidRemoved"].as<bool>()) != 0);
 		success = success && (gPrefsSettings.putBool("dAccRfidTwice", generalObj["dontAcceptRfidTwice"].as<bool>()) != 0);
@@ -742,6 +777,7 @@ WebsocketCodeType JSONToSettings(JsonObject doc) {
 		success = success && (gPrefsRfid.putUChar("rfidReaderType", generalObj["rfidReaderType"].as<uint8_t>()) != 0);
 		success = success && (gPrefsRfid.putBool("pn5180Lpcd", generalObj["pn5180Lpcd"].as<bool>()) != 0);
 		success = success && (gPrefsRfid.putUChar("mfrc522Gain", generalObj["mfrc522Gain"].as<uint8_t>()) != 0);
+		success = success && (gPrefsRfid.putUShort("rfidScanIntv", generalObj["mfrc522ScanInterval"].as<uint16_t>()) != 0);
 		success = success && (gPrefsRfid.putUShort("pn5180Debounce", generalObj["pn5180Debounce"].as<uint16_t>()) != 0);
 		if (!success) {
 			Log_Printf(LOGLEVEL_ERROR, webSaveSettingsError, "general");
@@ -753,7 +789,7 @@ WebsocketCodeType JSONToSettings(JsonObject doc) {
 		gPlayProperties.pauseIfRfidRemoved = generalObj["pauseIfRfidRemoved"].as<bool>();
 		gPlayProperties.resumeOnSameRfid = generalObj["resumeOnSameRfid"].as<bool>();
 		if (gPlayProperties.pauseIfRfidRemoved) {
-			// ignore feature silently if PAUSE_WHEN_RFID_REMOVED is active
+			// ignore feature silently if pauseIfRfidRemoved is active
 			Log_Println("pauseIfRfidRemoved is enabled -> deactivate dontAcceptRfidTwice", LOGLEVEL_NOTICE);
 			gPlayProperties.dontAcceptRfidTwice = false;
 		} else {
@@ -788,6 +824,12 @@ WebsocketCodeType JSONToSettings(JsonObject doc) {
 	if (doc["led"].is<JsonObject>()) {
 		// Neopixel settings
 		JsonObject ledObj = doc["led"];
+		if (ledObj["dimStates"].as<uint8_t>() == 0) {
+			// used as a divisor throughout Led.cpp's animations - a stored 0 would only surface as a
+			// crash on the next boot (Led_Init() self-heals it, but only then), so reject it here instead.
+			Log_Println("Invalid dimStates (must not be 0)", LOGLEVEL_ERROR);
+			return WebsocketCodeType::Error;
+		}
 		bool success = (gPrefsSettings.putUChar("iLedBrightness", ledObj["initBrightness"].as<uint8_t>()) != 0);
 		success = success && (gPrefsSettings.putUChar("nLedBrightness", ledObj["nightBrightness"].as<uint8_t>()) != 0);
 		success = success && (gPrefsSettings.putUChar("aLedBrightness", ledObj["atmoBrightness"].as<uint8_t>()) != 0);
@@ -838,6 +880,19 @@ WebsocketCodeType JSONToSettings(JsonObject doc) {
 		success = success && (gPrefsSettings.putUChar("btnLong3", buttonsObj["long3"].as<uint8_t>()) != 0);
 		success = success && (gPrefsSettings.putUChar("btnLong4", buttonsObj["long4"].as<uint8_t>()) != 0);
 		success = success && (gPrefsSettings.putUChar("btnLong5", buttonsObj["long5"].as<uint8_t>()) != 0);
+		for (uint8_t i = 0; i < 6; i++) { // "hold button + turn encoder" gestures
+			char keyCw[12], keyCcw[13], jsonCw[10], jsonCcw[11];
+			snprintf(keyCw, sizeof(keyCw), "btnRotCw%u", i);
+			snprintf(keyCcw, sizeof(keyCcw), "btnRotCcw%u", i);
+			snprintf(jsonCw, sizeof(jsonCw), "rotCw%u", i);
+			snprintf(jsonCcw, sizeof(jsonCcw), "rotCcw%u", i);
+			if (buttonsObj[jsonCw].is<uint8_t>()) {
+				success = success && (gPrefsSettings.putUChar(keyCw, buttonsObj[jsonCw].as<uint8_t>()) != 0);
+			}
+			if (buttonsObj[jsonCcw].is<uint8_t>()) {
+				success = success && (gPrefsSettings.putUChar(keyCcw, buttonsObj[jsonCcw].as<uint8_t>()) != 0);
+			}
+		}
 		success = success && (gPrefsSettings.putUChar("btnMulti01", buttonsObj["multi01"].as<uint8_t>()) != 0);
 		success = success && (gPrefsSettings.putUChar("btnMulti02", buttonsObj["multi02"].as<uint8_t>()) != 0);
 		success = success && (gPrefsSettings.putUChar("btnMulti03", buttonsObj["multi03"].as<uint8_t>()) != 0);
@@ -865,11 +920,23 @@ WebsocketCodeType JSONToSettings(JsonObject doc) {
 			Log_Printf(LOGLEVEL_ERROR, webSaveSettingsError, "rotary");
 			return WebsocketCodeType::Error;
 		}
+		// CMD_SEEK_PREVIEW tuning: guarded (not hard-erroring like "reverse" above) so an older cached
+		// web-UI page that doesn't send these yet can't blank an already-saved value.
+		if (doc["rotary"]["seekPrevDelay"].is<uint16_t>()) {
+			gPrefsSettings.putUShort("seekPrevDelay", doc["rotary"]["seekPrevDelay"].as<uint16_t>());
+		}
+		if (doc["rotary"]["seekPrevSweep"].is<uint8_t>()) {
+			uint8_t seekPrevSweep = doc["rotary"]["seekPrevSweep"].as<uint8_t>();
+			if (seekPrevSweep < 1) {
+				seekPrevSweep = 1; // must be >= 1 to avoid divide-by-zero in seek-preview
+			}
+			gPrefsSettings.putUChar("seekPrevSweep", seekPrevSweep);
+		}
 		RotaryEncoder_Init();
 	}
 	if (doc["battery"].is<JsonObject>()) {
 		// Battery settings
-		if (gPrefsSettings.putFloat("wLowVoltage", doc["battery"]["warnLowVoltage"].as<float>()) == 0 || gPrefsSettings.putFloat("vIndicatorLow", doc["battery"]["indicatorLow"].as<float>()) == 0 || gPrefsSettings.putFloat("vIndicatorHigh", doc["battery"]["indicatorHi"].as<float>()) == 0 || gPrefsSettings.putFloat("wCritVoltage", doc["battery"]["criticalVoltage"].as<float>()) == 0 || gPrefsSettings.putUInt("vCheckIntv", doc["battery"]["voltageCheckInterval"].as<uint8_t>()) == 0) {
+		if (gPrefsSettings.putFloat("wLowVoltage", doc["battery"]["warnLowVoltage"].as<float>()) == 0 || gPrefsSettings.putFloat("vIndicatorLow", doc["battery"]["indicatorLow"].as<float>()) == 0 || gPrefsSettings.putFloat("vIndicatorHigh", doc["battery"]["indicatorHi"].as<float>()) == 0 || gPrefsSettings.putFloat("wCritVoltage", doc["battery"]["criticalVoltage"].as<float>()) == 0 || gPrefsSettings.putBool("shutdownBatCrit", doc["battery"]["shutdownOnCritical"].as<bool>()) == 0 || gPrefsSettings.putUInt("vCheckIntv", doc["battery"]["voltageCheckInterval"].as<uint8_t>()) == 0) {
 			Log_Printf(LOGLEVEL_ERROR, webSaveSettingsError, "battery");
 			return WebsocketCodeType::Error;
 		}
@@ -988,6 +1055,7 @@ WebsocketCodeType JSONToSettings(JsonObject doc) {
 				return WebsocketCodeType::Error;
 			}
 		}
+		Rfid_ResetLastTag(); // The tag means something else now: make sure re-applying it is not deduped away
 		Web_DumpNvsToSd("rfidTags", backupFile); // Store backup-file every time when a new rfid-tag is programmed
 	} else if (doc["rfidAssign"].is<JsonObject>()) {
 		const char *_rfidIdAssinId = doc["rfidAssign"]["rfidIdMusic"];
@@ -1000,9 +1068,7 @@ WebsocketCodeType JSONToSettings(JsonObject doc) {
 		char rfidString[275];
 		snprintf(rfidString, sizeof(rfidString) / sizeof(rfidString[0]), "%s%s%s0%s%u%s0", stringDelimiter, _fileOrUrlAscii, stringDelimiter, stringDelimiter, _playMode, stringDelimiter);
 		gPrefsRfid.putString(_rfidIdAssinId, rfidString);
-		if (gPlayProperties.dontAcceptRfidTwice) {
-			Rfid_ResetOldRfid(); // Set old rfid-id to crap in order to allow to re-apply a new assigned rfid-tag exactly once
-		}
+		Rfid_ResetLastTag(); // The tag means something else now: make sure re-applying it is not deduped away
 
 		String s = gPrefsRfid.getString(_rfidIdAssinId, "-1");
 		if (s.compareTo(rfidString)) {
@@ -1083,19 +1149,23 @@ static void settingsToJSON(JsonObject obj, const String section) {
 		// general settings
 		JsonObject generalObj = obj["general"].to<JsonObject>();
 		generalObj["initVolume"].set(gPrefsSettings.getUInt("initVolume", 3));
+		generalObj["minVolume"].set(gPrefsSettings.getUInt("minVolume", AUDIOPLAYER_VOLUME_MIN));
 		generalObj["maxVolumeSp"].set(gPrefsSettings.getUInt("maxVolumeSp", 21));
 		generalObj["maxVolumeHp"].set(gPrefsSettings.getUInt("maxVolumeHp", 21));
 		generalObj["sleepInactivity"].set(gPrefsSettings.getUInt("mInactiviyT", 10));
+		generalObj["rotSeekStep"].set(gPrefsSettings.getUChar("rotSeekStep", JUMP_OFFSET_ROTARY)); // seconds per detent when seeking via a rotary gesture
 		generalObj["playMono"].set(gPrefsSettings.getBool("playMono", false));
 		generalObj["savePosShutdown"].set(gPrefsSettings.getBool("savePosShutdown", false)); // SAVE_PLAYPOS_BEFORE_SHUTDOWN
 		generalObj["savePosRfidChge"].set(gPrefsSettings.getBool("savePosRfidChge", false)); // SAVE_PLAYPOS_WHEN_RFID_CHANGE
+		generalObj["savePosInterval"].set(gPrefsSettings.getUShort("savePosIntv", 0)); // SAVE_PLAYPOS_INTERVAL (periodic checkpoint seconds, 0 = off)
 		generalObj["playLastRfidOnReboot"].set(gPrefsSettings.getBool("playLastOnBoot", false)); // PLAY_LAST_RFID_AFTER_REBOOT
 		generalObj["pauseIfRfidRemoved"].set(gPrefsSettings.getBool("pauseRfidRem", false)); // PAUSE_WHEN_RFID_REMOVED
 		generalObj["dontAcceptRfidTwice"].set(gPrefsSettings.getBool("dAccRfidTwice", false)); // DONT_ACCEPT_SAME_RFID_TWICE
-		generalObj["resumeOnSameRfid"].set(gPrefsSettings.getBool("p2pSameRfid", false)); // RESUME_ON_SAME_RFID (only in combination with DONT_ACCEPT_SAME_RFID_TWICE)
+		generalObj["resumeOnSameRfid"].set(gPrefsSettings.getBool("p2pSameRfid", false)); // RESUME_ON_SAME_RFID
 		generalObj["rfidReaderType"].set(gPrefsRfid.getUChar("rfidReaderType", 0)); // RFID_READER_TYPE_RUNTIME
 		generalObj["pn5180Lpcd"].set(gPrefsRfid.getBool("pn5180Lpcd", false)); // PN5180 LPCD
 		generalObj["mfrc522Gain"].set(gPrefsRfid.getUChar("mfrc522Gain", 7)); // MFRC522_GAIN
+		generalObj["mfrc522ScanInterval"].set(gPrefsRfid.getUShort("rfidScanIntv", 100)); // RFID_SCAN_INTERVAL
 		generalObj["pn5180Debounce"].set(gPrefsRfid.getUShort("pn5180Debounce", 500)); // PN5180 debounce (ms)
 		generalObj["pauseOnMinVol"].set(gPrefsSettings.getBool("pauseOnMinVol", false)); // PAUSE_ON_MIN_VOLUME
 		generalObj["recoverVolBoot"].set(gPrefsSettings.getBool("recoverVolBoot", false)); // USE_LAST_VOLUME_AFTER_REBOOT
@@ -1137,12 +1207,12 @@ static void settingsToJSON(JsonObject obj, const String section) {
 		ledObj["initBrightness"].set(gPrefsSettings.getUChar("iLedBrightness", 0));
 		ledObj["nightBrightness"].set(gPrefsSettings.getUChar("nLedBrightness", 0));
 		ledObj["atmoBrightness"].set(gPrefsSettings.getUChar("aLedBrightness", 0));
-		ledObj["numIndicator"].set(gPrefsSettings.getUChar("numIndicator", NUM_INDICATOR_LEDS));
-		uint8_t numControlLeds = gPrefsSettings.getUChar("numControl", NUM_CONTROL_LEDS);
+		ledObj["numIndicator"].set(gPrefsSettings.getUChar("numIndicator", 24)); // NUM_INDICATOR_LEDS
+		uint8_t numControlLeds = gPrefsSettings.getUChar("numControl", 0); // NUM_CONTROL_LEDS
 		ledObj["numControl"].set(numControlLeds);
 		if (numControlLeds > 0) {
 			// get control led colors from NVS
-			std::vector<CRGB::HTMLColorCode> controlLedColors = CONTROL_LEDS_COLORS;
+			std::vector<CRGB::HTMLColorCode> controlLedColors = {}; // CONTROL_LEDS_COLORS
 			size_t keySize = gPrefsSettings.getBytesLength("controlColors");
 			if (keySize == (numControlLeds * sizeof(CRGB::HTMLColorCode))) {
 				controlLedColors.resize(numControlLeds);
@@ -1155,13 +1225,13 @@ static void settingsToJSON(JsonObject obj, const String section) {
 				}
 			}
 		}
-		ledObj["numIdleDots"].set(gPrefsSettings.getUChar("numIdleDots", NUM_LEDS_IDLE_DOTS));
-		ledObj["offsetPause"].set(gPrefsSettings.getBool("offsetPause", OFFSET_PAUSE_LEDS));
-		ledObj["hueStart"].set(gPrefsSettings.getShort("hueStart", PROGRESS_HUE_START));
-		ledObj["hueEnd"].set(gPrefsSettings.getShort("hueEnd", PROGRESS_HUE_END));
-		ledObj["hueAtmo"].set(gPrefsSettings.getShort("hueAtmo", ATMO_HUE));
-		ledObj["satAtmo"].set(gPrefsSettings.getShort("satAtmo", ATMO_SATURATION));
-		ledObj["dimStates"].set(gPrefsSettings.getUChar("dimStates", DIMMABLE_STATES));
+		ledObj["numIdleDots"].set(gPrefsSettings.getUChar("numIdleDots", 4)); // NUM_LEDS_IDLE_DOTS
+		ledObj["offsetPause"].set(gPrefsSettings.getBool("offsetPause", false)); // OFFSET_PAUSE_LEDS
+		ledObj["hueStart"].set(gPrefsSettings.getShort("hueStart", 85)); // PROGRESS_HUE_START
+		ledObj["hueEnd"].set(gPrefsSettings.getShort("hueEnd", -1)); // PROGRESS_HUE_END
+		ledObj["hueAtmo"].set(gPrefsSettings.getShort("hueAtmo", 10)); // ATMO_HUE
+		ledObj["satAtmo"].set(gPrefsSettings.getShort("satAtmo", 180)); // ATMO_SATURATION
+		ledObj["dimStates"].set(gPrefsSettings.getUChar("dimStates", 50)); // DIMMABLE_STATES
 		ledObj["reverseRot"].set(gPrefsSettings.getBool("ledReverseRot", false));
 		ledObj["offsetStart"].set(gPrefsSettings.getUChar("ledOffset", 0));
 	}
@@ -1169,6 +1239,15 @@ static void settingsToJSON(JsonObject obj, const String section) {
 	if ((section == "") || (section == "buttons")) {
 		// button settings
 		JsonObject buttonsObj = obj["buttons"].to<JsonObject>();
+		for (uint8_t i = 0; i < 6; i++) { // "hold button + turn encoder" gestures
+			char keyCw[12], keyCcw[13], jsonCw[10], jsonCcw[11];
+			snprintf(keyCw, sizeof(keyCw), "btnRotCw%u", i);
+			snprintf(keyCcw, sizeof(keyCcw), "btnRotCcw%u", i);
+			snprintf(jsonCw, sizeof(jsonCw), "rotCw%u", i);
+			snprintf(jsonCcw, sizeof(jsonCcw), "rotCcw%u", i);
+			buttonsObj[jsonCw].set(Button_GetRotaryAction(i, true));
+			buttonsObj[jsonCcw].set(Button_GetRotaryAction(i, false));
+		}
 		buttonsObj["short0"].set(gPrefsSettings.getUChar("btnShort0", BUTTON_0_SHORT));
 		buttonsObj["short1"].set(gPrefsSettings.getUChar("btnShort1", BUTTON_1_SHORT));
 		buttonsObj["short2"].set(gPrefsSettings.getUChar("btnShort2", BUTTON_2_SHORT));
@@ -1201,6 +1280,8 @@ static void settingsToJSON(JsonObject obj, const String section) {
 		// Rotary encoder
 		JsonObject rotaryObj = obj["rotary"].to<JsonObject>();
 		rotaryObj["reverse"].set(gPrefsSettings.getBool("rotaryReverse", false));
+		rotaryObj["seekPrevDelay"].set(gPrefsSettings.getUShort("seekPrevDelay", 2000)); // ms idle before a CMD_SEEK_PREVIEW gesture auto-commits
+		rotaryObj["seekPrevSweep"].set(gPrefsSettings.getUChar("seekPrevSweep", 40)); // encoder detents for a full 0->100% sweep
 	}
 	// playlist
 	if ((section == "") || (section == "playlist")) {
@@ -1216,9 +1297,8 @@ static void settingsToJSON(JsonObject obj, const String section) {
 		batteryObj["warnLowVoltage"].set(gPrefsSettings.getFloat("wLowVoltage", s_warningLowVoltage));
 		batteryObj["indicatorLow"].set(gPrefsSettings.getFloat("vIndicatorLow", s_voltageIndicatorLow));
 		batteryObj["indicatorHi"].set(gPrefsSettings.getFloat("vIndicatorHigh", s_voltageIndicatorHigh));
-		#ifdef SHUTDOWN_ON_BAT_CRITICAL
 		batteryObj["criticalVoltage"].set(gPrefsSettings.getFloat("wCritVoltage", s_warningCriticalVoltage));
-		#endif
+		batteryObj["shutdownOnCritical"].set(gPrefsSettings.getBool("shutdownBatCrit", false)); // SHUTDOWN_ON_BAT_CRITICAL
 	#endif
 
 		batteryObj["voltageCheckInterval"].set(gPrefsSettings.getUInt("vCheckIntv", s_batteryCheckInterval));
@@ -1229,22 +1309,25 @@ static void settingsToJSON(JsonObject obj, const String section) {
 		JsonObject defaultsObj = obj["defaults"].to<JsonObject>();
 		JsonObject genSettings = defaultsObj["general"].to<JsonObject>();
 		genSettings["initVolume"].set(AUDIOPLAYER_VOLUME_INIT);
+		genSettings["minVolume"].set(AUDIOPLAYER_VOLUME_MIN);
 		genSettings["maxVolumeSp"].set(AUDIOPLAYER_VOLUME_MAX);
 		genSettings["maxVolumeHp"].set(18u); // gPrefsSettings.getUInt("maxVolumeHp", 0));
 		genSettings["sleepInactivity"].set(10u); // System_MaxInactivityTime
 		genSettings["playMono"].set(false); // PLAY_MONO_SPEAKER
 		genSettings["savePosShutdown"].set(false); // SAVE_PLAYPOS_BEFORE_SHUTDOWN
 		genSettings["savePosRfidChge"].set(false); // SAVE_PLAYPOS_WHEN_RFID_CHANGE
+		genSettings["savePosInterval"].set(0); // SAVE_PLAYPOS_INTERVAL (periodic checkpoint seconds, 0 = off)
 		genSettings["playLastRfidOnReboot"].set(false); // PLAY_LAST_RFID_AFTER_REBOOT
 		genSettings["pauseIfRfidRemoved"].set(false); // PAUSE_WHEN_RFID_REMOVED
 		genSettings["dontAcceptRfidTwice"].set(false); // DONT_ACCEPT_SAME_RFID_TWICE
-		genSettings["resumeOnSameRfid"].set(false); // RESUME_ON_SAME_RFID (only in combination with DONT_ACCEPT_SAME_RFID_TWICE)
+		genSettings["resumeOnSameRfid"].set(false); // RESUME_ON_SAME_RFID
 		genSettings["pauseOnMinVol"].set(false); // PAUSE_ON_MIN_VOLUME
 		genSettings["recoverVolBoot"].set(false); // USE_LAST_VOLUME_AFTER_REBOOT
 		genSettings["volumeCurve"].set(0u); // VOLUME_CURVE
 		genSettings["rfidReaderType"].set(0u); // RFID_READER_TYPE_RUNTIME (auto-detect)
 		genSettings["pn5180Lpcd"].set(false); // PN5180 LPCD disabled
 		genSettings["mfrc522Gain"].set(7u); // MFRC522_GAIN default (max gain)
+		genSettings["mfrc522ScanInterval"].set(100u); // RFID_SCAN_INTERVAL default
 		genSettings["pn5180Debounce"].set(500u); // PN5180 debounce (ms) default
 		JsonObject eqSettings = defaultsObj["equalizer"].to<JsonObject>();
 		eqSettings["gainHighPass"].set(0);
@@ -1255,27 +1338,19 @@ static void settingsToJSON(JsonObject obj, const String section) {
 		ledSettings["initBrightness"].set(16u); // LED_INITIAL_BRIGHTNESS
 		ledSettings["nightBrightness"].set(2u); // LED_INITIAL_NIGHT_BRIGHTNESS
 		ledSettings["atmoBrightness"].set(30u); // LED_INITIAL_NIGHT_BRIGHTNESS
-		ledSettings["numIndicator"].set(NUM_INDICATOR_LEDS); // NUM_INDICATOR_LEDS
-		ledSettings["numControl"].set(NUM_CONTROL_LEDS); // NUM_CONTROL_LEDS
-		ledSettings["numIdleDots"].set(NUM_LEDS_IDLE_DOTS); // NUM_LEDS_IDLE_DOTS
-		ledSettings["offsetPause"].set(OFFSET_PAUSE_LEDS); // OFFSET_PAUSE_LEDS
-		ledSettings["hueStart"].set(PROGRESS_HUE_START); // PROGRESS_HUE_START
-		ledSettings["hueEnd"].set(PROGRESS_HUE_END); // PROGRESS_HUE_END
-		ledSettings["hueAtmo"].set(ATMO_HUE);
-		ledSettings["satAtmo"].set(ATMO_SATURATION);
-		ledSettings["dimStates"].set(DIMMABLE_STATES); // DIMMABLE_STATES
-	#ifdef NEOPIXEL_REVERSE_ROTATION
-		ledSettings["reverseRot"].set(true);
-	#else
-		ledSettings["reverseRot"].set(false);
-	#endif
-	#ifdef LED_OFFSET
-		ledSettings["offsetStart"].set(LED_OFFSET);
-	#else
-		ledSettings["offsetStart"].set(0);
-	#endif
+		ledSettings["numIndicator"].set(24u); // NUM_INDICATOR_LEDS
+		ledSettings["numControl"].set(0u); // NUM_CONTROL_LEDS
+		ledSettings["numIdleDots"].set(4u); // NUM_LEDS_IDLE_DOTS
+		ledSettings["offsetPause"].set(false); // OFFSET_PAUSE_LEDS
+		ledSettings["hueStart"].set(85); // PROGRESS_HUE_START
+		ledSettings["hueEnd"].set(-1); // PROGRESS_HUE_END
+		ledSettings["hueAtmo"].set(10); // ATMO_HUE
+		ledSettings["satAtmo"].set(180); // ATMO_SATURATION
+		ledSettings["dimStates"].set(50u); // DIMMABLE_STATES
+		ledSettings["reverseRot"].set(false); // NEOPIXEL_REVERSE_ROTATION
+		ledSettings["offsetStart"].set(0); // LED_OFFSET
 		JsonArray colorArr = ledSettings["controlColors"].to<JsonArray>();
-		std::vector<CRGB::HTMLColorCode> controlLedColors = CONTROL_LEDS_COLORS;
+		std::vector<CRGB::HTMLColorCode> controlLedColors = {}; // CONTROL_LEDS_COLORS
 		for (uint8_t controlLed = 0; controlLed < controlLedColors.size(); controlLed++) {
 			colorArr.add(controlLedColors[controlLed]);
 		}
@@ -1308,9 +1383,18 @@ static void settingsToJSON(JsonObject obj, const String section) {
 		buttonsSettings["multi34"].set(BUTTON_MULTI_34);
 		buttonsSettings["multi35"].set(BUTTON_MULTI_35);
 		buttonsSettings["multi45"].set(BUTTON_MULTI_45);
+		for (uint8_t i = 0; i < 6; i++) { // "hold button + turn encoder" gestures
+			char jsonCw[10], jsonCcw[11];
+			snprintf(jsonCw, sizeof(jsonCw), "rotCw%u", i);
+			snprintf(jsonCcw, sizeof(jsonCcw), "rotCcw%u", i);
+			buttonsSettings[jsonCw].set(Button_GetRotaryActionDefault(i, true));
+			buttonsSettings[jsonCcw].set(Button_GetRotaryActionDefault(i, false));
+		}
 #ifdef USEROTARY_ENABLE
 		JsonObject rotarySettings = defaultsObj["rotary"].to<JsonObject>();
 		rotarySettings["reverse"].set(false); // REVERSE_ROTARY
+		rotarySettings["seekPrevDelay"].set(2000);
+		rotarySettings["seekPrevSweep"].set(40);
 #endif
 		JsonObject playlistSettings = defaultsObj["playlist"].to<JsonObject>();
 		playlistSettings["sortMode"].set(EnumUtils::underlying_value(AUDIOPLAYER_PLAYLIST_SORT_MODE_DEFAULT));
@@ -1321,9 +1405,8 @@ static void settingsToJSON(JsonObject obj, const String section) {
 		batSettings["warnLowVoltage"].set(s_warningLowVoltage);
 		batSettings["indicatorLow"].set(s_voltageIndicatorLow);
 		batSettings["indicatorHi"].set(s_voltageIndicatorHigh);
-		#ifdef SHUTDOWN_ON_BAT_CRITICAL
 		batSettings["criticalVoltage"].set(s_warningCriticalVoltage);
-		#endif
+		batSettings["shutdownOnCritical"].set(false); // SHUTDOWN_ON_BAT_CRITICAL
 	#endif
 		batSettings["voltageCheckInterval"].set(s_batteryCheckInterval);
 #endif
@@ -1720,28 +1803,22 @@ void onWebsocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsE
 	}
 }
 
-// Handles file upload request from the explorer
-// requires a GET parameter path, as directory path to the file
-void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final) {
-
+// Handles a raw (non-multipart) file upload request from the explorer.
+// requires a GET parameter path (folder + filename) for the target file.
+// One request per file; the client loops over multiple files sequentially
+// since only one upload can be in flight at a time (shared buffers below).
+static void explorerHandleFileUpload(AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
 	System_UpdateActivityTimer();
 
-	// New File
-	if (!index) {
-		// reset abort flag
+	if (index == 0) {
 		uploadAborted = false;
 
-		String utf8Folder = "/";
-		String utf8FilePath;
+		String filePath = "/";
 		if (request->hasParam("path")) {
-			const AsyncWebParameter *param = request->getParam("path");
-			utf8Folder = param->value() + "/";
+			filePath = request->getParam("path")->value();
 		}
-		utf8FilePath = utf8Folder + filename;
 
-		const char *filePath = utf8FilePath.c_str();
-
-		Log_Printf(LOGLEVEL_INFO, writingFile, filePath);
+		Log_Printf(LOGLEVEL_INFO, writingFile, filePath.c_str());
 
 		if (!allocateDoubleBuffer()) {
 			// we failed to allocate enough memory
@@ -1750,7 +1827,6 @@ void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, s
 			return;
 		}
 
-		// Create Queue for receiving a signal from the store task as synchronisation
 		if (explorerFileUploadFinished == NULL) {
 			explorerFileUploadFinished = xSemaphoreCreateBinary();
 		} else {
@@ -1766,8 +1842,7 @@ void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, s
 			buffer_full[i] = false;
 		}
 
-		// Create Task for handling the storage of the data
-		const char *filePathCopy = x_strdup(filePath);
+		const char *filePathCopy = x_strdup(filePath.c_str());
 		xTaskCreatePinnedToCore(
 			explorerHandleFileStorageTask, /* Function to implement the task */
 			"fileStorageTask", /* Name of the task */
@@ -1778,10 +1853,7 @@ void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, s
 			1 /* Core where the task should run */
 		);
 
-		// register for early disconnect events
 		request->onDisconnect([]() {
-			// client went away before we were finished...
-			// trigger task suicide, since we can not use Log_Println here
 			xTaskNotify(fileStorageTaskHandle, 2u, eSetValueWithOverwrite);
 		});
 	}
@@ -1833,7 +1905,7 @@ void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, s
 		}
 	}
 
-	if (final) {
+	if (index + len >= total) {
 		if (uploadAborted) {
 			handleUploadError(request, 500);
 			return;
@@ -1844,7 +1916,7 @@ void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, s
 		}
 		// notify storage task that last data was stored on the ring buffer
 		xTaskNotify(fileStorageTaskHandle, 1u, eSetValueWithOverwrite);
-		// watit until the storage task is sending the signal to finish
+		// wait until the storage task is sending the signal to finish
 		if (xSemaphoreTake(explorerFileUploadFinished, pdMS_TO_TICKS(30000)) != pdTRUE) {
 			// timeout, something went wrong
 			Log_Println(webTxCanceled, LOGLEVEL_ERROR);
@@ -2200,9 +2272,7 @@ void explorerHandleAudioRequest(AsyncWebServerRequest *request) {
 		playModeString = param->value();
 
 		playMode = atoi(playModeString.c_str());
-		if (gPlayProperties.dontAcceptRfidTwice) {
-			Rfid_ResetOldRfid();
-		}
+		Rfid_ResetLastTag(); // Another playlist is loaded now: re-applying the last tag must reload it, not toggle pause
 		AudioPlayer_SetPlaylist(filePath, 0, playMode, 0);
 	} else {
 		Log_Println("AUDIO: No path variable set", LOGLEVEL_ERROR);
@@ -2230,6 +2300,89 @@ void handleGetSavedSSIDs(AsyncWebServerRequest *request) {
 
 	response->setLength();
 	request->send(response);
+}
+
+// Map an 802.11 disconnect reason code onto a coarse, user-explainable class.
+// The page translates the class into a localized message; the raw code is
+// reported alongside for the curious/for support.
+static const char *classifyDisconnectReason(uint8_t reason) {
+	switch (reason) {
+		case 0: // no disconnect event: association held, but no IP arrived
+			return "timeout";
+		case WIFI_REASON_AUTH_EXPIRE:
+		case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+		case WIFI_REASON_GROUP_KEY_UPDATE_TIMEOUT:
+		case WIFI_REASON_IE_IN_4WAY_DIFFERS:
+		case WIFI_REASON_AUTH_FAIL:
+		case WIFI_REASON_HANDSHAKE_TIMEOUT:
+			return "wrong_password";
+		case WIFI_REASON_NO_AP_FOUND:
+		case 210: // NO_AP_FOUND_IN_RSSI_THRESHOLD (IDF >= 5.3)
+		case 211: // NO_AP_FOUND_IN_AUTHMODE_THRESHOLD
+		case 212: // NO_AP_FOUND_IN_BAND
+		case 213: // NO_AP_FOUND_W_COMPATIBLE_SECURITY
+			return "not_found";
+		case WIFI_REASON_ASSOC_TOOMANY:
+		case WIFI_REASON_802_1X_AUTH_FAILED:
+		case WIFI_REASON_CIPHER_SUITE_REJECTED:
+		case WIFI_REASON_ASSOC_FAIL:
+		case WIFI_REASON_CONNECTION_FAIL:
+			return "rejected";
+		default:
+			return "other";
+	}
+}
+
+// Current WiFi state plus diagnostics of the last failed connection attempt.
+// Used by the accesspoint page to tell the user why their credentials didn't
+// work instead of silently falling back to the setup AP.
+void handleGetWifiStatus(AsyncWebServerRequest *request) {
+	AsyncJsonResponse *response = new AsyncJsonResponse();
+	JsonObject obj = response->getRoot();
+
+	obj["state"] = Wlan_GetConnectState();
+	if (Wlan_IsConnected()) {
+		obj["ssid"] = Wlan_GetCurrentSSID();
+		obj["ip"] = Wlan_GetIpAddress();
+	}
+
+	String failSsid;
+	uint8_t failReason;
+	if (Wlan_GetLastFailure(failSsid, failReason)) {
+		JsonObject fail = obj["last_failure"].to<JsonObject>();
+		fail["ssid"] = failSsid;
+		fail["reason"] = failReason;
+		fail["class"] = classifyDisconnectReason(failReason);
+	}
+
+	// live connection test (started via POST /wifitest from the setup page)
+	const char *testPhase = Wlan_GetTestPhase();
+	if (strcmp(testPhase, "idle") != 0) {
+		JsonObject test = obj["test"].to<JsonObject>();
+		test["phase"] = testPhase;
+		test["ssid"] = Wlan_GetTestSsid();
+		if (strcmp(testPhase, "failed") == 0) {
+			const uint8_t reason = Wlan_GetTestReason();
+			test["reason"] = reason;
+			test["class"] = classifyDisconnectReason(reason);
+		} else if (strcmp(testPhase, "success") == 0) {
+			test["ip"] = Wlan_GetIpAddress();
+		}
+	}
+
+	response->setLength();
+	request->send(response);
+}
+
+// Start a live connection test while in AP mode. Body: {"ssid": "..."} —
+// the credentials must have been saved via POST /savedSSIDs beforehand.
+void handlePostWifiTest(AsyncWebServerRequest *request, JsonVariant &json) {
+	const char *ssid = json["ssid"].as<const char *>();
+	if (!ssid || !Wlan_StartConnectionTest(ssid)) {
+		request->send(400);
+		return;
+	}
+	request->send(200);
 }
 
 void handlePostSavedSSIDs(AsyncWebServerRequest *request, JsonVariant &json) {
@@ -2501,6 +2654,7 @@ static void handlePostRFIDRequest(AsyncWebServerRequest *request, JsonVariant &j
 	char rfidString[275];
 	snprintf(rfidString, sizeof(rfidString) / sizeof(rfidString[0]), "%s%s%s0%s%u%s0", stringDelimiter, _fileOrUrlAscii, stringDelimiter, stringDelimiter, _playModeOrModId, stringDelimiter);
 	gPrefsRfid.putString(tagId.c_str(), rfidString);
+	Rfid_ResetLastTag(); // The tag means something else now: make sure re-applying it is not deduped away
 
 	String s = gPrefsRfid.getString(tagId.c_str(), "-1");
 	if (s.compareTo(rfidString)) {
@@ -2532,6 +2686,7 @@ static void handleDeleteRFIDRequest(AsyncWebServerRequest *request) {
 			Cmd_Action(CMD_STOP);
 		}
 		if (gPrefsRfid.remove(tagId.c_str())) {
+			Rfid_ResetLastTag(); // The tag means nothing now: make sure re-applying it is not deduped away
 			Log_Printf(LOGLEVEL_INFO, "/rfid (DELETE): tag %s removed successfuly", tagId);
 			request->send(200, "text/plain; charset=utf-8", tagId + " removed successfuly");
 		} else {
@@ -2641,6 +2796,7 @@ void Web_DumpSdToNvs(const char *_filename) {
 	}
 
 	Led_SetPause(false);
+	Rfid_ResetLastTag(); // Tags may mean something else now: make sure re-applying one is not deduped away
 	Log_Printf(LOGLEVEL_NOTICE, importCountNokNvs, invalidCount);
 	tmpFile.close();
 	gFSystem.remove(_filename);

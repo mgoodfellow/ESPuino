@@ -24,12 +24,82 @@
 #include "main.h"
 #include "strnatcmp.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cmath>
 #include <esp_task_wdt.h>
 #include <freertos/task.h>
 #include <random>
 
 // Allocate gPlayProperties in PSRAM if available
 EXT_RAM_BSS_ATTR playProps gPlayProperties;
+
+// Pending relative seek in seconds, written from the button/rotary/web tasks and drained by the audio loop.
+static std::atomic<int16_t> AudioPlayer_PendingSeekSeconds {0};
+
+void AudioPlayer_AddSeekOffset(const int16_t seconds) {
+	AudioPlayer_PendingSeekSeconds.fetch_add(seconds, std::memory_order_relaxed);
+}
+
+// Seek-preview (rotary gesture, CMD_SEEK_PREVIEW): turning moves a not-yet-committed target position
+// instead of jumping immediately; committed via the existing SEEK_POS_PERCENT path once the encoder is
+// idle for a configurable delay, or immediately on release (see RotaryEncoder.cpp). currentRelPos must
+// never be touched before the commit -- it also drives the LED progress ring, and writing the preview
+// target into it early would make played-back position look like it already jumped.
+static std::atomic<bool> AudioPlayer_SeekPreviewActive {false};
+static std::atomic<uint8_t> AudioPlayer_SeekPreviewTargetPercent {0};
+static double AudioPlayer_SeekPreviewTargetExact = 0.0; // full precision; only ever touched by the loop() task
+static uint32_t AudioPlayer_SeekPreviewLastInputMs = 0; // only ever touched by the loop() task
+// Cached once per gesture (in Start()), not re-read from NVS on every AudioPlayer_Loop() iteration/detent:
+// the idle-commit check below runs on every single loop() cycle for as long as a gesture is held, and a
+// NVS getUShort/getUChar still costs a mutex lock + key lookup each time even though it's RAM-cached.
+static uint16_t AudioPlayer_SeekPreviewDelayMsCached = 2000;
+static uint8_t AudioPlayer_SeekPreviewSweepCached = 40;
+
+void AudioPlayer_SeekPreviewStart(void) {
+	if (gPlayProperties.audioFileDuration == 0) {
+		return; // no meaningful target for webstreams / unknown-length content
+	}
+	AudioPlayer_SeekPreviewDelayMsCached = gPrefsSettings.getUShort("seekPrevDelay", 2000);
+	AudioPlayer_SeekPreviewSweepCached = gPrefsSettings.getUChar("seekPrevSweep", 40);
+	if (AudioPlayer_SeekPreviewSweepCached < 1) {
+		AudioPlayer_SeekPreviewSweepCached = 1; // guard against divide-by-zero in AudioPlayer_SeekPreviewAdjust
+	}
+	AudioPlayer_SeekPreviewTargetExact = gPlayProperties.currentRelPos; // start from where playback is, not 0
+	AudioPlayer_SeekPreviewTargetPercent.store(static_cast<uint8_t>(std::lround(AudioPlayer_SeekPreviewTargetExact)), std::memory_order_relaxed);
+	AudioPlayer_SeekPreviewLastInputMs = millis();
+	AudioPlayer_SeekPreviewActive.store(true, std::memory_order_relaxed);
+}
+
+void AudioPlayer_SeekPreviewAdjust(const int32_t detents) {
+	if (!AudioPlayer_SeekPreviewActive.load(std::memory_order_relaxed)) {
+		return;
+	}
+	AudioPlayer_SeekPreviewTargetExact = std::clamp(AudioPlayer_SeekPreviewTargetExact + (detents * 100.0 / AudioPlayer_SeekPreviewSweepCached), 0.0, 100.0);
+	AudioPlayer_SeekPreviewTargetPercent.store(static_cast<uint8_t>(std::lround(AudioPlayer_SeekPreviewTargetExact)), std::memory_order_relaxed);
+	AudioPlayer_SeekPreviewLastInputMs = millis();
+}
+
+void AudioPlayer_SeekPreviewCommit(void) {
+	if (!AudioPlayer_SeekPreviewActive.load(std::memory_order_relaxed)) {
+		return;
+	}
+	gPlayProperties.currentRelPos = AudioPlayer_SeekPreviewTargetPercent.load(std::memory_order_relaxed);
+	gPlayProperties.seekmode = SEEK_POS_PERCENT;
+	AudioPlayer_SeekPreviewActive.store(false, std::memory_order_relaxed);
+}
+
+void AudioPlayer_SeekPreviewCancel(void) {
+	AudioPlayer_SeekPreviewActive.store(false, std::memory_order_relaxed);
+}
+
+bool AudioPlayer_IsSeekPreviewActive(void) {
+	return AudioPlayer_SeekPreviewActive.load(std::memory_order_relaxed);
+}
+
+uint8_t AudioPlayer_GetSeekPreviewTargetPercent(void) {
+	return AudioPlayer_SeekPreviewTargetPercent.load(std::memory_order_relaxed);
+}
 
 // Playlist
 static playlistSortMode AudioPlayer_PlaylistSortMode = AUDIOPLAYER_PLAYLIST_SORT_MODE_DEFAULT;
@@ -88,6 +158,7 @@ BaseType_t trackQStatus = pdFAIL;
 uint8_t trackCommand = NO_ACTION;
 bool audioReturnCode;
 uint32_t AudioPlayer_LastPlaytimeStatsTimestamp = 0u;
+static uint32_t AudioPlayer_resumeSeekPendingSecs = 0; // deferred resume-seek target (seconds); 0 = none pending (declared early: used by the audio_info evt_bitrate callback above AudioPlayer_Loop)
 Playlist *newPlayList = nullptr;
 bool newPlayListAvailable = false;
 
@@ -103,7 +174,7 @@ static void AudioPlayer_RememberRfidForWifiRetry(const char *rfidTagId) {
 	gRetryRfidOnWifiConnect = true;
 }
 
-// "Arm" the release of the DONT_ACCEPT_SAME_RFID_TWICE-lock: called by the RFID-handler the moment a new
+// "Arm" the release of the dontAcceptRfidTwice-lock: called by the RFID-handler the moment a new
 // tag is accepted, it records that this playback-attempt happened. The lock is then actually released the
 // next time the player becomes idle (see AudioPlayer_Cyclic()), which re-allows the same tag to be applied
 // again. Arming on acceptance - rather than on playback becoming active - is deliberate: it ensures the
@@ -166,6 +237,22 @@ void Audio_InfoCallback(Audio::msg_t m) {
 		}
 		case Audio::evt_bitrate: {
 			Log_Printf(LOGLEVEL_INFO, "bitrate:      %s", m.msg);
+			// Deferred audiobook resume-seek. connecttoFS(fileStartTime) only seeks files whose
+			// Xing/VBR header sets m_nominal_bitrate; headerless CBR audiobooks are never seeked and
+			// restart from 0. This event fires once the measured average bitrate has *stabilised*, so
+			// setAudioPlayTime() now lands accurately and the lib re-syncs the reported play-time to
+			// match (seeking earlier, before the bitrate settles, both mis-positions and desyncs the
+			// clock). Guards: only when a resume is pending, the target is within the file, and we are
+			// not already there (a VBR file the lib already positioned at connect).
+			if (AudioPlayer_resumeSeekPendingSecs > 0 && audio != nullptr) {
+				const uint32_t target = AudioPlayer_resumeSeekPendingSecs;
+				AudioPlayer_resumeSeekPendingSecs = 0; // one-shot regardless of outcome
+				if (target < audio->getAudioFileDuration() && target > audio->getAudioCurrentTime() + 3) {
+					if (audio->setAudioPlayTime(target)) {
+						Log_Printf(LOGLEVEL_NOTICE, "Resume: deferred seek to position %u", target);
+					}
+				}
+			}
 			break;
 		}
 		case Audio::evt_icyurl: {
@@ -335,6 +422,12 @@ void AudioPlayer_Init(void) {
 		Log_Println(wroteMaxLoudnessForSpeakerToNvs, LOGLEVEL_ERROR);
 	}
 
+	// Get minimum volume from NVS. Unlike the max values, 0 (= AUDIOPLAYER_VOLUME_MIN) is a perfectly
+	// valid setting and in fact the default, so a plain read-with-default is used instead of the
+	// "0 means unset, write default" pattern above. AudioPlayer_SetVolume() clamps every volume change
+	// to this floor, so a non-zero value takes effect for all volume sources (rotary, buttons, BT, web).
+	AudioPlayer_SetMinVolume(gPrefsSettings.getUInt("minVolume", AUDIOPLAYER_VOLUME_MIN));
+
 #ifdef HEADPHONE_ADJUST_ENABLE
 	#if (HP_DETECT >= 0 && HP_DETECT <= MAX_GPIO)
 	pinMode(HP_DETECT, INPUT_PULLUP);
@@ -369,24 +462,13 @@ void AudioPlayer_Init(void) {
 	AudioPlayer_StationLogoUrl = "";
 	gPlayProperties.playlist = allocatePlaylist();
 	gPlayProperties.SavePlayPosRfidChange = gPrefsSettings.getBool("savePosRfidChge", false); // SAVE_PLAYPOS_WHEN_RFID_CHANGE
+	gPlayProperties.savePosIntervalSecs = gPrefsSettings.getUShort("savePosIntv", 0); // SAVE_PLAYPOS_INTERVAL (periodic checkpoint, 0 = off)
 	gPlayProperties.pauseOnMinVolume = gPrefsSettings.getBool("pauseOnMinVol", false); // PAUSE_ON_MIN_VOLUME
-#ifdef PAUSE_WHEN_RFID_REMOVED
-	gPlayProperties.pauseIfRfidRemoved = gPrefsSettings.getBool("pauseRfidRem", true);
-#else
-	gPlayProperties.pauseIfRfidRemoved = gPrefsSettings.getBool("pauseRfidRem", false);
-#endif
-#ifdef DONT_ACCEPT_SAME_RFID_TWICE
-	gPlayProperties.dontAcceptRfidTwice = gPrefsSettings.getBool("dAccRfidTwice", true);
-#else
-	gPlayProperties.dontAcceptRfidTwice = gPrefsSettings.getBool("dAccRfidTwice", false);
-#endif
-#ifdef RESUME_ON_SAME_RFID
-	gPlayProperties.resumeOnSameRfid = gPrefsSettings.getBool("p2pSameRfid", true);
-#else
-	gPlayProperties.resumeOnSameRfid = gPrefsSettings.getBool("p2pSameRfid", false);
-#endif
+	gPlayProperties.pauseIfRfidRemoved = gPrefsSettings.getBool("pauseRfidRem", false); // PAUSE_WHEN_RFID_REMOVED
+	gPlayProperties.dontAcceptRfidTwice = gPrefsSettings.getBool("dAccRfidTwice", false); // DONT_ACCEPT_SAME_RFID_TWICE
+	gPlayProperties.resumeOnSameRfid = gPrefsSettings.getBool("p2pSameRfid", false); // RESUME_ON_SAME_RFID
 	if (gPlayProperties.pauseIfRfidRemoved) {
-		// ignore feature silently if PAUSE_WHEN_RFID_REMOVED is active
+		// ignore feature silently if pauseIfRfidRemoved is active
 		Log_Println("pauseIfRfidRemoved is enabled -> deactivate dontAcceptRfidTwice", LOGLEVEL_NOTICE);
 		gPlayProperties.dontAcceptRfidTwice = false;
 	}
@@ -395,14 +477,20 @@ void AudioPlayer_Init(void) {
 	audio->setI2SCommFMT_LSB(true);
 #endif
 
-	AudioPlayer_CurrentVolume = AudioPlayer_GetInitVolume();
+	// Raise the boot volume to the configured minimum if it sits below it: the init/remembered volume is
+	// applied directly here (not via AudioPlayer_SetVolume(), which is where the min-clamp lives), so
+	// without this the box could start below its own floor until the first volume change.
+	AudioPlayer_CurrentVolume = std::max(AudioPlayer_GetInitVolume(), AudioPlayer_GetMinVolume());
 	// DMA-settings must be adjusted before setting the pinout
-	audio->setOutput16Bit(true); // to save dma-buffer and because we just don't need more than 16 bit
-	audio->settings.DMA_DESC_NUM = 32;
-	audio->settings.DMA_FRAME_NUM = 256; // not too high, so safe SRAM
 	if (System_GetOperationMode() == OPMODE_BLUETOOTH_SOURCE) {
 		audio->setOutputSampleRate(Audio::OutputSR_t::SR_44100);
+		audio->settings.DMA_FRAME_NUM = 192; // not too high, to safe some SRAM
+	} else if (System_GetOperationMode() == OPMODE_BLUETOOTH_SINK) {
+		audio->settings.DMA_FRAME_NUM = 192; // not too high, to safe some SRAM
+	} else {
+		// just use default-values
 	}
+
 	audio->setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
 	audio->setVolumeSteps(AUDIOPLAYER_VOLUME_MAX);
 	audio->setVolumeCurve(Audio_GetVolume);
@@ -433,6 +521,8 @@ void AudioPlayer_Exit(void) {
 }
 
 static uint32_t lastPlayingTimestamp = 0;
+static uint32_t AudioPlayer_lastCheckpointTimestamp = 0; // millis() of the last periodic play-position checkpoint
+static uint32_t AudioPlayer_lastCheckpointPos = 0; // last checkpointed play-position (seconds) for dedup
 
 void AudioPlayer_Cyclic(void) {
 	if (AudioPlayer_UploadActive) {
@@ -444,6 +534,25 @@ void AudioPlayer_Cyclic(void) {
 		// audio is playing, update the playtime since start
 		lastPlayingTimestamp = millis();
 		playTimeSecSinceStart += 1;
+
+		// Periodic play-position checkpoint for long audiobooks (opt-in via savePosIntv, 0 = off).
+		// Bounds the position lost to an *ungraceful* power-off -- dead battery, yanked plug, watchdog
+		// reboot -- while the card is still on the reader. The graceful paths (pause, card-removal,
+		// clean shutdown) already save, but only on a clean transition; nothing saves if power just
+		// disappears mid-file, so playback restarts from the start of that file on resume. Gated on
+		// audiobook mode (saveLastPlayPosition) plus a minimum file length, so short/split tracks --
+		// which already checkpoint at every track boundary -- don't needlessly wear the NVS flash.
+		constexpr uint32_t checkpointMinDurationSecs = 300; // below 5 min, per-track boundary saves suffice
+		if (gPlayProperties.savePosIntervalSecs > 0 && gPlayProperties.saveLastPlayPosition && !gPlayProperties.isWebstream
+			&& audio != nullptr && audio->getAudioFileDuration() >= checkpointMinDurationSecs
+			&& (millis() - AudioPlayer_lastCheckpointTimestamp >= (uint32_t) gPlayProperties.savePosIntervalSecs * 1000)) {
+			uint32_t checkpointPos = audio->getAudioCurrentTime();
+			if (checkpointPos != AudioPlayer_lastCheckpointPos) { // dedup: skip if position hasn't advanced (e.g. stalled)
+				AudioPlayer_NvsRfidWriteWrapper(gPlayProperties.playRfidTag, checkpointPos, gPlayProperties.playMode, gPlayProperties.currentTrackNumber);
+				AudioPlayer_lastCheckpointPos = checkpointPos;
+			}
+			AudioPlayer_lastCheckpointTimestamp = millis();
+		}
 	}
 
 	// Actual loop stuff
@@ -672,7 +781,8 @@ void AudioPlayer_Loop() {
 			// If we're in audiobook-mode and apply a modification-card, we don't
 			// want to save lastPlayPosition for the mod-card but for the card that holds the playlist
 			if (strlen(gCurrentRfidTagId) > 0) {
-				strncpy(gPlayProperties.playRfidTag, gCurrentRfidTagId, sizeof(gPlayProperties.playRfidTag) / sizeof(gPlayProperties.playRfidTag[0]));
+				strncpy(gPlayProperties.playRfidTag, gCurrentRfidTagId, sizeof(gPlayProperties.playRfidTag) - 1);
+				gPlayProperties.playRfidTag[sizeof(gPlayProperties.playRfidTag) - 1] = '\0';
 			}
 		}
 		if (gPlayProperties.trackFinished) {
@@ -1011,8 +1121,14 @@ void AudioPlayer_Loop() {
 				return;
 			} else {
 				int32_t fileStartTime = -1;
+				AudioPlayer_resumeSeekPendingSecs = 0; // default: no deferred seek for this track
 				if (gPlayProperties.startAtFilePos > 0) {
 					fileStartTime = gPlayProperties.startAtFilePos;
+					// Also arm a deferred seek: ESP32-audioI2S only honors this connecttoFS() start
+					// position for files whose Xing/VBR header sets m_nominal_bitrate. Headerless CBR
+					// audiobooks never get seeked here and restart from 0, so we re-seek ourselves once
+					// the measured bitrate is known (see AudioPlayer_Loop). Harmless for VBR (skipped).
+					AudioPlayer_resumeSeekPendingSecs = gPlayProperties.startAtFilePos;
 					Log_Printf(LOGLEVEL_NOTICE, trackStartatPos, gPlayProperties.startAtFilePos);
 					gPlayProperties.startAtFilePos = 0;
 				}
@@ -1033,6 +1149,12 @@ void AudioPlayer_Loop() {
 			gPlayProperties.trackFinished = true;
 			return;
 		} else {
+			// Restart the periodic-checkpoint clock for the freshly-started track, so the first
+			// checkpoint lands one full interval into playback (not immediately) rather than
+			// firing at once; the 0 baseline just means the first checkpoint always writes.
+			AudioPlayer_lastCheckpointTimestamp = millis();
+			AudioPlayer_lastCheckpointPos = 0;
+			AudioPlayer_SeekPreviewCancel(); // a preview from the previous track must never commit onto this one
 			if (gPlayProperties.currentTrackNumber) {
 				Led_Indicate(LedIndicatorType::PlaylistProgress);
 			}
@@ -1051,21 +1173,28 @@ void AudioPlayer_Loop() {
 		}
 	}
 
+	// Relative seek. Accumulated in an atomic so that firing CMD_SEEK_* once per rotary detent scrubs
+	// proportionally instead of collapsing into a single jump (seekmode was a single overwrite-able enum
+	// consumed once per iteration, so rapid repeats were lost).
+	const int16_t seekOffset = AudioPlayer_PendingSeekSeconds.exchange(0, std::memory_order_relaxed);
+	if (seekOffset != 0) {
+		if (audio->setTimeOffset(seekOffset)) {
+			Log_Printf(LOGLEVEL_NOTICE, (seekOffset > 0) ? secondsJumpForward : secondsJumpBackward, abs(seekOffset));
+		}
+	}
+
+	// Seek-preview (CMD_SEEK_PREVIEW rotary gesture): commit once the encoder has been idle for the
+	// configured delay. A release-triggered commit happens directly from RotaryEncoder.cpp instead of
+	// waiting for this -- this is only the "held but stopped turning" case.
+	if (AudioPlayer_SeekPreviewActive.load(std::memory_order_relaxed)) {
+		if (millis() - AudioPlayer_SeekPreviewLastInputMs >= AudioPlayer_SeekPreviewDelayMsCached) {
+			AudioPlayer_SeekPreviewCommit();
+		}
+	}
+
 	// Handle seekmodes
 	if (gPlayProperties.seekmode != SEEK_NORMAL) {
-		if (gPlayProperties.seekmode == SEEK_FORWARDS) {
-			if (audio->setTimeOffset(jumpOffset)) {
-				Log_Printf(LOGLEVEL_NOTICE, secondsJumpForward, jumpOffset);
-			} else {
-				System_IndicateError();
-			}
-		} else if (gPlayProperties.seekmode == SEEK_BACKWARDS) {
-			if (audio->setTimeOffset(-(jumpOffset))) {
-				Log_Printf(LOGLEVEL_NOTICE, secondsJumpBackward, jumpOffset);
-			} else {
-				System_IndicateError();
-			}
-		} else if ((gPlayProperties.seekmode == SEEK_POS_PERCENT) && (gPlayProperties.currentRelPos > 0) && (gPlayProperties.currentRelPos < 100)) {
+		if ((gPlayProperties.seekmode == SEEK_POS_PERCENT) && (gPlayProperties.currentRelPos >= 0) && (gPlayProperties.currentRelPos < 100)) {
 			uint32_t newFileTime = uint32_t((gPlayProperties.currentRelPos / 100.0f) * audio->getAudioFileDuration());
 			if (audio->setAudioPlayTime(newFileTime)) {
 				Log_Printf(LOGLEVEL_NOTICE, JumpToPosition, newFileTime, audio->getAudioFileDuration());
@@ -1205,14 +1334,18 @@ void AudioPlayer_SetVolume(const int32_t _newVolume) {
 	int32_t _volumeBuf = AudioPlayer_GetCurrentVolume();
 
 	Led_Indicate(LedIndicatorType::VolumeChange);
-	if (_newVolume < AudioPlayer_GetMinVolume()) {
+	// Clamp rather than reject: a fast rotary spin can ask for several steps at once, and rejecting the whole
+	// change meant that near the rails (e.g. 20 -> 23 with max 21) nothing happened at all instead of pinning.
+	int32_t clampedVolume = _newVolume;
+	if (clampedVolume < AudioPlayer_GetMinVolume()) {
+		clampedVolume = AudioPlayer_GetMinVolume();
 		Log_Println(minLoudnessReached, LOGLEVEL_INFO);
-		return;
-	} else if (_newVolume > AudioPlayer_GetMaxVolume()) {
+	} else if (clampedVolume > AudioPlayer_GetMaxVolume()) {
+		clampedVolume = AudioPlayer_GetMaxVolume();
 		Log_Println(maxLoudnessReached, LOGLEVEL_INFO);
-		return;
-	} else {
-		_volume = _newVolume;
+	}
+	{
+		_volume = clampedVolume;
 		AudioPlayer_SetCurrentVolume(_volume);
 
 		Log_Printf(LOGLEVEL_INFO, newLoudnessReceived, _volume);
@@ -1221,7 +1354,7 @@ void AudioPlayer_SetVolume(const int32_t _newVolume) {
 #ifdef MQTT_ENABLE
 		publishMqtt(topicLoudness, static_cast<uint32_t>(_volume), false);
 #endif
-		AudioPlayer_PauseOnMinVolume(_volumeBuf, _newVolume);
+		AudioPlayer_PauseOnMinVolume(_volumeBuf, clampedVolume);
 	}
 }
 
@@ -1657,7 +1790,13 @@ void audio_oggimage(File &file, std::vector<uint32_t> v) {
 // record audiodata or send via BT
 void audio_process_i2s(int32_t *outBuff, int16_t validSamples, bool *continueI2S) {
 	if ((System_GetOperationMode() == OPMODE_BLUETOOTH_SOURCE) && Bluetooth_Device_Connected()) {
-		Bluetooth_Source_SendAudioData(outBuff, validSamples);
+		// do downsamling to 16bit and send via BT
+		int16_t *outBuff16 = reinterpret_cast<int16_t *>(outBuff);
+		for (int16_t i = 0; i < validSamples * 2; i++) {
+			outBuff16[i] = outBuff16[i * 2 + 1];
+		}
+
+		Bluetooth_Source_SendAudioData(outBuff16, validSamples);
 		*continueI2S = false;
 		return;
 	}

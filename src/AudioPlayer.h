@@ -46,7 +46,7 @@ typedef struct { // Bit field
 	bool SavePlayPosRfidChange	 : 1; // Save last play-position
 	bool pauseOnMinVolume		 : 1; // When playback is active and volume is changed to zero, playback is paused automatically.
 	bool pauseIfRfidRemoved		 : 1; // When playback is active and RFID is removed, playback is paused automatically.
-	bool dontAcceptRfidTwice	 : 1; // RFID-reader doesn't accept the same RFID-tag twice in a row (unless it's a modification-card or RFID-tag is unknown in NVS). Flag will be ignored silently if PAUSE_WHEN_RFID_REMOVED is active. (https://forum.espuino.de/t/neues-feature-dont-accept-same-rfid-twice/1247)
+	bool dontAcceptRfidTwice	 : 1; // RFID-reader doesn't accept the same RFID-tag twice in a row (unless it's a modification-card or RFID-tag is unknown in NVS). Flag will be ignored silently if pauseIfRfidRemoved is active. (https://forum.espuino.de/t/neues-feature-dont-accept-same-rfid-twice/1247)
 	bool resumeOnSameRfid		 : 1; // If pause is active and same RFID is put on again, playback continues (only effective if dontAcceptRfidTwice is enabled)
 	int16_t jumpToFolderTrack = -1; // track to jump to
 	int8_t gainLowPass = 0; // Low Pass for EQ Control
@@ -55,6 +55,7 @@ typedef struct { // Bit field
 	size_t coverFilePos; // current cover file position
 	size_t coverFileSize; // current cover file size
 	size_t audioFileDuration; // file duration of current audio file (in seconds)
+	uint16_t savePosIntervalSecs = 0; // periodic play-position checkpoint interval in seconds (0 = disabled)
 } playProps;
 
 extern playProps gPlayProperties;
@@ -71,6 +72,16 @@ void AudioPlayer_SetVolume(const int32_t _newVolume);
 void AudioPlayer_SetEqualizer(const int8_t gainLowPass, const int8_t gainBandPass, const int8_t gainHighPass);
 void AudioPlayer_SetPlaylist(const char *_itemToPlay, const uint32_t _lastPlayPos, const uint32_t _playMode, const uint16_t _trackLastPlayed);
 void AudioPlayer_SetTrackControl(const uint8_t trackCommand);
+// Queue a relative seek. Accumulates, so one call per rotary detent scrubs proportionally.
+void AudioPlayer_AddSeekOffset(const int16_t seconds);
+// Seek-preview (CMD_SEEK_PREVIEW rotary gesture): moves a not-yet-committed target position instead of
+// jumping immediately; commits via the existing SEEK_POS_PERCENT path (see RotaryEncoder.cpp).
+void AudioPlayer_SeekPreviewStart(void);
+void AudioPlayer_SeekPreviewAdjust(const int32_t detents);
+void AudioPlayer_SeekPreviewCommit(void);
+void AudioPlayer_SeekPreviewCancel(void);
+bool AudioPlayer_IsSeekPreviewActive(void);
+uint8_t AudioPlayer_GetSeekPreviewTargetPercent(void);
 // Arm the "don't accept same RFID twice"-lock to be released on the next idle-state. Called when a tag is
 // accepted, independent of whether playback actually starts, so a tag whose first track fails immediately
 // (e.g. a webstream without WiFi) does not stay locked forever.
