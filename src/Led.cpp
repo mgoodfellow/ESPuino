@@ -1379,3 +1379,21 @@ void Led_ShowOtaProgress(uint8_t percent) {
 	FastLED.show();
 #endif
 }
+
+// Blink the whole ring red synchronously, for a fatal boot-time error (e.g. an
+// SD mount failure) where the async LED task isn't reliably drawing yet.
+// Suspends the LED task so it can't fight for the strip, then blinks red
+// in-place. Caller typically reboots afterwards.
+void Led_ShowError(uint8_t blinks) {
+#ifdef NEOPIXEL_ENABLE
+	if (Led_TaskHandle) {
+		vTaskSuspend(Led_TaskHandle);
+	}
+	for (uint8_t i = 0; i < blinks; i++) {
+		FastLED.showColor(CRGB(40, 0, 0)); // dim red (~16%)
+		delay(250);
+		FastLED.showColor(CRGB::Black);
+		delay(250);
+	}
+#endif
+}
