@@ -94,7 +94,7 @@ void RfidMfrc522_TaskReset(void) {
 // PICC_WakeupA return type both differ between the two libraries, so we let the
 // compiler pick the right ones per instantiation.
 template <typename Reader>
-static bool RfidMfrc522_CardStillPresent(Reader &reader) {
+static bool RfidMfrc522_CardStillPresent(Reader &reader, uint8_t *outStatus = nullptr) {
 	byte bufferATQA[2];
 	byte bufferSize = sizeof(bufferATQA);
 	// Reset baud-rate / modulation-width registers exactly like
@@ -107,7 +107,29 @@ static bool RfidMfrc522_CardStillPresent(Reader &reader) {
 	auto result = reader.PICC_WakeupA(bufferATQA, &bufferSize);
 	// Immediately park the card back in HALT so the next WUPA is meaningful.
 	reader.PICC_HaltA();
+	if (outStatus != nullptr) {
+		*outStatus = static_cast<uint8_t>(result);
+	}
 	return (result == Reader::STATUS_OK || result == Reader::STATUS_COLLISION);
+}
+
+// DEBUG-ONLY (branch debug/wupa-trace): after a WUPA miss, ask again with REQA.
+// REQA (0x26) only invites cards in the IDLE state; WUPA (0x52) invites IDLE *and*
+// HALT. So the pair discriminates the two candidate faults:
+//   REQA answers where WUPA didn't -> the card is present and powered, it just
+//                                     ignores WUPA-from-HALT (card-type quirk).
+//   both fail                      -> the card isn't being powered/heard at all
+//                                     (coupling, field strength, interference).
+template <typename Reader>
+static uint8_t RfidMfrc522_ProbeReqa(Reader &reader) {
+	byte bufferATQA[2];
+	byte bufferSize = sizeof(bufferATQA);
+	reader.PCD_WriteRegister(Reader::TxModeReg, 0x00);
+	reader.PCD_WriteRegister(Reader::RxModeReg, 0x00);
+	reader.PCD_WriteRegister(Reader::ModWidthReg, 0x26);
+	auto result = reader.PICC_RequestA(bufferATQA, &bufferSize);
+	reader.PICC_HaltA();
+	return static_cast<uint8_t>(result);
 }
 
 template <typename Reader>
@@ -202,18 +224,34 @@ static void RfidMfrc522_TaskImpl(Reader &reader) {
 				// test raw WUPA reliability with zero tolerance for a missed poll.
 				constexpr uint8_t removalDebounceCycles = 2;
 				uint8_t consecutiveMisses = 0;
+				uint32_t pollCount = 0;
+				uint32_t okCount = 0;
+				const uint32_t pollStart = millis();
 				while (true) {
 					if (rfidScanInterval / 2 >= 20) {
 						vTaskDelay(portTICK_PERIOD_MS * (rfidScanInterval / 2));
 					} else {
 						vTaskDelay(portTICK_PERIOD_MS * 20);
 					}
-					if (RfidMfrc522_CardStillPresent(reader)) {
+					uint8_t wupaStatus = 0xEE;
+					pollCount++;
+					if (RfidMfrc522_CardStillPresent(reader, &wupaStatus)) {
+						okCount++;
+						if (consecutiveMisses > 0) {
+							Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: recovered after %u miss(es) [poll=%u ok=%u]", consecutiveMisses, pollCount, okCount);
+						}
 						consecutiveMisses = 0;
-					} else if (++consecutiveMisses >= removalDebounceCycles) {
-						break;
+					} else {
+						// status codes: 0=OK 1=ERROR 2=COLLISION 3=TIMEOUT 4=NO_ROOM
+						//               5=INTERNAL_ERROR 6=INVALID 7=CRC_WRONG 255=MIFARE_NACK
+						const uint8_t reqaStatus = RfidMfrc522_ProbeReqa(reader);
+						Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: miss %u/%u wupa=%u reqa=%u [poll=%u ok=%u t=%ums]", consecutiveMisses + 1, removalDebounceCycles, wupaStatus, reqaStatus, pollCount, okCount, millis() - pollStart);
+						if (++consecutiveMisses >= removalDebounceCycles) {
+							break;
+						}
 					}
 				}
+				Log_Printf(LOGLEVEL_NOTICE, "WUPA-DBG: removal declared -- %u polls, %u ok, held %ums", pollCount, okCount, millis() - pollStart);
 
 				Log_Println(rfidTagRemoved, LOGLEVEL_NOTICE);
 				// Only pause if there's actually something to pause -- otherwise removing a card after the
