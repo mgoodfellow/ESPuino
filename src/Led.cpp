@@ -19,34 +19,6 @@
 #include <esp_task_wdt.h>
 
 #ifdef NEOPIXEL_ENABLE
-	// FastLED's WS2812 backends don't work on this Arduino 3.x / ESP-IDF 5.x stack:
-	// on the S3 the clockless-SPI backend claims the FSPI host and RMT5 fails; on the
-	// classic ESP32 the SPI-DMA backend aborts (ESP_ERROR_CHECK in SpiStripWs2812::
-	// waitDone) once SD + RFID already own both SPI hosts. So the strip is driven
-	// through NeoPixelBus instead — FastLED is kept only for the CRGB/CHSV math and
-	// the animation buffer. NeoPixelBus's RMT method is unusable here too (2.8.4 uses
-	// the legacy RMT driver, which aborts under the core's driver_ng), so the output
-	// method is target-specific (see Led_InitStrip): S3 -> LCD/GDMA, classic ESP32 ->
-	// the I2S peripheral 1 method (I2S0 is left for the audio path).
-	#define LED_USE_NEOPIXELBUS 1
-
-	#if defined(CONFIG_IDF_TARGET_ESP32S3)
-		#include <esp_idf_version.h>
-		#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
-			// IDF 5.5 removed gpio_hal_iomux_func_sel(), but NeoPixelBus (<= 2.8.4)
-			// still calls it from the S3 LCD-method header. PIN_FUNC_SELECT is the
-			// operation that function wrapped.
-			#include <soc/io_mux_reg.h>
-inline void gpio_hal_iomux_func_sel(uint32_t pin_name, uint32_t func) {
-	PIN_FUNC_SELECT(pin_name, func);
-}
-		#endif
-	#endif // CONFIG_IDF_TARGET_ESP32S3
-
-	#include <NeoPixelBus.h>
-#endif
-
-#ifdef NEOPIXEL_ENABLE
 	#define LED_INDICATOR_SET(indicator)	((Led_Indicators) |= (1u << ((uint8_t) indicator)))
 	#define LED_INDICATOR_IS_SET(indicator) (((Led_Indicators) & (1u << ((uint8_t) indicator))) > 0u)
 	#define LED_INDICATOR_CLEAR(indicator)	((Led_Indicators) &= ~(1u << ((uint8_t) indicator)))
@@ -190,42 +162,28 @@ bool Led_LoadSettings(LedSettings &settings) {
 #endif
 
 #ifdef NEOPIXEL_ENABLE
-	#ifdef LED_USE_NEOPIXELBUS
-// Map FastLED's COLOR_ORDER setting onto the matching NeoPixelBus feature
-template <EOrder order>
-struct NeoFeatureFor;
-
-template <>
-struct NeoFeatureFor<RGB> {
-	using type = NeoRgbFeature;
-};
-
-template <>
-struct NeoFeatureFor<GRB> {
-	using type = NeoGrbFeature;
-};
-
-		#if defined(CONFIG_IDF_TARGET_ESP32S3)
-using LedStripMethod = NeoEsp32LcdX8Ws2812xMethod; // S3: LCD/GDMA (RMT unusable; no free SPI host)
-		#else
-using LedStripMethod = NeoEsp32I2s1Ws2812xMethod; // classic ESP32: I2S peripheral 1 (I2S0 = audio)
-		#endif
-using LedStrip = NeoPixelBus<NeoFeatureFor<COLOR_ORDER>::type, LedStripMethod>;
-static LedStrip *ledStrip = nullptr;
-// Perceptual dimming: WS2812 output is ~linear in its 8-bit value but the eye is ~logarithmic,
-// so a plain linear brightness scale barely dims until the very bottom of the range. Gamma-correct
-// the (already brightness-scaled) colour in Led_ShowStrip so perceived brightness tracks the
-// setting — a wide, smooth dimming range instead of "bright until it snaps off".
-static NeoGamma<NeoGammaCieLabEquationMethod> ledGamma;
+	#ifdef LED_USE_FASTLED_FLEX_IO
+static fl::ChannelPtr ledChannel;
 	#endif
 
 // (Re-)initialize the LED output driver for the given total number of leds
 static void Led_InitStrip(CRGB *leds, uint16_t count) {
-	#ifdef LED_USE_NEOPIXELBUS
-	delete ledStrip; // the dtor releases the peripheral, so a re-init doesn't leak it
-	ledStrip = new LedStrip(count, LED_PIN);
-	ledStrip->Begin();
-	Log_Printf(LOGLEVEL_NOTICE, "LED: NeoPixelBus strip initialized (%u leds on GPIO %u)", count, LED_PIN);
+	#ifdef LED_USE_FASTLED_FLEX_IO
+	using ConfiguredChipset = CHIPSET<LED_PIN, COLOR_ORDER>;
+	static_assert(fl::is_same<ConfiguredChipset, WS2812B<LED_PIN, COLOR_ORDER>>::value,
+		"FastLED FLEX_IO needs an explicit timing mapping for the configured CHIPSET");
+
+	fl::ChannelOptions options;
+	options.mCorrection = TypicalSMD5050;
+	options.mDitherMode = DISABLE_DITHER;
+	options.mBus = fl::Bus::FLEX_IO;
+	options.mBusWhich = 0;
+	fl::ChannelConfigOf<fl::ClocklessChipset> config(
+		fl::makeClockless<fl::TIMING_WS2812_800KHZ>(LED_PIN),
+		fl::span<CRGB>(leds, count), COLOR_ORDER, options);
+	FastLED.setExclusiveDriver<fl::Bus::FLEX_IO, 0>();
+	ledChannel = fl::Channel::create(config);
+	FastLED.add(ledChannel);
 	#else
 	FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, count).setCorrection(TypicalSMD5050);
 	#endif
@@ -233,33 +191,24 @@ static void Led_InitStrip(CRGB *leds, uint16_t count) {
 
 // Push the CRGB working buffer out to the strip
 static void Led_ShowStrip(CRGB *leds, uint16_t count) {
-	#ifdef LED_USE_NEOPIXELBUS
-	// NeoPixelBus has no global brightness or color-correction, so apply
-	// FastLED's semantics (brightness x TypicalSMD5050) per pixel here
-	const uint8_t b = gLedSettings.Led_Brightness;
-	const uint8_t scaleR = scale8(0xFF, b);
-	const uint8_t scaleG = scale8(0xB0, b);
-	const uint8_t scaleB = scale8(0xF0, b);
-	for (uint16_t i = 0; i < count; i++) {
-		const RgbColor c(scale8(leds[i].r, scaleR), scale8(leds[i].g, scaleG), scale8(leds[i].b, scaleB));
-		ledStrip->SetPixelColor(i, ledGamma.Correct(c));
-	}
-	ledStrip->Show();
-	#else
+	(void) leds;
+	(void) count;
 	FastLED.show();
+	#ifdef LED_USE_FASTLED_FLEX_IO
+	static bool driverLogged = false;
+	if (!driverLogged && ledChannel) {
+		const fl::DeviceInfo info = fl::deviceInfo<fl::Bus::FLEX_IO, 0>();
+		const fl::string engineName = ledChannel->getEngineName();
+		Log_Printf(LOGLEVEL_NOTICE, "LED: FastLED %s instance 0 -> %s/%s (engine %s, %u leds on GPIO %u)",
+			info.bus_name, info.vendor_name, info.device_name, engineName.c_str(), count, LED_PIN);
+		driverLogged = true;
+	}
 	#endif
 }
 
 // Turn all leds off immediately (also called from outside the led-task)
 static void Led_ClearStrip(void) {
-	#ifdef LED_USE_NEOPIXELBUS
-	if (ledStrip) {
-		ledStrip->ClearTo(RgbColor(0));
-		ledStrip->Show();
-	}
-	#else
 	FastLED.clear(true);
-	#endif
 }
 #endif
 
@@ -515,11 +464,9 @@ static void Led_Task(void *parameter) {
 	indicator = new CRGBSet(leds, numIndicatorLeds);
 	// initialize the LED driver
 	Led_InitStrip(leds, numIndicatorLeds + numControlLeds);
-	#ifndef LED_USE_NEOPIXELBUS
 	FastLED.setBrightness(gLedSettings.Led_Brightness);
 	FastLED.setDither(DISABLE_DITHER);
 	FastLED.setMaxRefreshRate(200); // limit LED refresh rate to 200Hz (less likely to cause flickering)
-	#endif
 
 	LedAnimationType activeAnimation = LedAnimationType::NoNewAnimation;
 	LedAnimationType nextAnimation = LedAnimationType::NoNewAnimation;
@@ -614,9 +561,7 @@ static void Led_Task(void *parameter) {
 
 		// apply brightness-changes
 		if (lastLedBrightness != gLedSettings.Led_Brightness) {
-	#ifndef LED_USE_NEOPIXELBUS
 			FastLED.setBrightness(gLedSettings.Led_Brightness);
-	#endif
 			lastLedBrightness = gLedSettings.Led_Brightness;
 		}
 
@@ -1504,25 +1449,11 @@ void Led_ShowError(uint8_t blinks) {
 	if (Led_TaskHandle) {
 		vTaskSuspend(Led_TaskHandle);
 	}
-	#ifdef LED_USE_NEOPIXELBUS
-	delete ledStrip; // drop any (possibly half-initialized) strip, start clean
-	ledStrip = new LedStrip(gLedSettings.numIndicatorLeds + gLedSettings.numControlLeds, LED_PIN);
-	ledStrip->Begin();
-	for (uint8_t i = 0; i < blinks; i++) {
-		ledStrip->ClearTo(RgbColor(40, 0, 0)); // dim red (~16%)
-		ledStrip->Show();
-		delay(250);
-		ledStrip->ClearTo(RgbColor(0, 0, 0));
-		ledStrip->Show();
-		delay(250);
-	}
-	#else
 	for (uint8_t i = 0; i < blinks; i++) {
 		FastLED.showColor(CRGB(40, 0, 0));
 		delay(250);
 		FastLED.showColor(CRGB::Black);
 		delay(250);
 	}
-	#endif
 #endif
 }
