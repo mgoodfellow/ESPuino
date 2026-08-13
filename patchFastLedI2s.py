@@ -24,16 +24,6 @@ if not engine.is_file() or not peripheral.is_file():
 
 replace_exact(
     engine,
-    "namespace fl {\n\n",
-    "namespace fl {\n\n"
-    "// Keep the one-shot I2S FIFO fed with low samples throughout the WS2812\n"
-    "// reset interval.\n"
-    "constexpr size_t kWs2812ResetTailBytes =\n"
-    "    (TIMING_WS2812_800KHZ::RESET * 6400000ULL / 1000000ULL) * sizeof(u16);\n\n",
-)
-
-replace_exact(
-    engine,
     """    // Size the scratch buffer: max per-lane byte count across all
     // in-flight channels. Three regions (see packScratchBuffer):
     //   [0, 2W)        — 32-bit DMA samples (4 bytes per pulse), the
@@ -42,8 +32,8 @@ replace_exact(
     //   [3W, 3W + 16b) — 16-lane-strided transpose input
     // where W = wave8I2s1EncodedFrameSize(bytes_per_lane).
 """,
-    """    // Size the scratch buffer for the 16-bit parallel DMA stream plus reset
-    // preamble/tail and the lane-strided transpose input.
+    """    // Size the scratch buffer for the native 16-bit parallel DMA stream
+    // and the lane-strided transpose input.
 """,
 )
 
@@ -56,7 +46,7 @@ replace_exact(
 """,
     """    const size_t wave8_size = wave8I2s1EncodedFrameSize(bytes_per_lane);
     const size_t input_size = 16 * bytes_per_lane;
-    const size_t required = wave8_size + 2 * kWs2812ResetTailBytes + input_size;
+    const size_t required = wave8_size + input_size;
 """,
 )
 
@@ -91,13 +81,13 @@ replace_exact(
 """,
     """    const size_t input_size = 16 * bytes_per_lane;
     const size_t wave8_size = wave8I2s1EncodedFrameSize(bytes_per_lane);
-    if (mScratchSize < wave8_size + 2 * kWs2812ResetTailBytes + input_size) {
+    if (mScratchSize < wave8_size + input_size) {
         // Belt-and-suspenders: defense against a stale scratch buffer
         // surviving a show() that used a much smaller frame.
         return 0;
     }
-    fl::u8* const output = mScratchBuffer + kWs2812ResetTailBytes;
-    fl::u8* const input = output + wave8_size + kWs2812ResetTailBytes;
+    fl::u8* const output = mScratchBuffer;
+    fl::u8* const input = output + wave8_size;
 """,
 )
 
@@ -123,9 +113,7 @@ replace_exact(
         return 0;
     }
 
-    fl::memset(mScratchBuffer, 0, kWs2812ResetTailBytes);
-    fl::memset(output + wave8_size, 0, kWs2812ResetTailBytes);
-    return wave8_size + 2 * kWs2812ResetTailBytes;
+    return wave8_size;
 """,
 )
 
@@ -178,17 +166,4 @@ replace_exact(
 """,
 )
 
-replace_exact(
-    peripheral,
-    """    if (int_state & I2S_OUT_EOF_INT_ST_M) {
-        self->finishTransmitFromIsr();
-""",
-    """    if (int_state & I2S_OUT_EOF_INT_ST_M) {
-        // The reset-low tail has drained into the FIFO; stop before underrun
-        // can replay stale samples as another WS2812 frame.
-        i2s->conf.tx_start = 0;
-        self->finishTransmitFromIsr();
-""",
-)
-
-print("Applied classic ESP32 FastLED I2S 16-bit transport fix")
+print("Applied classic ESP32 FastLED I2S 16-bit format fix")
