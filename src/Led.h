@@ -58,15 +58,29 @@ struct AnimationReturnType {
 		, animationRefresh(refresh) { }
 };
 
+// Step and floor for the CMD_BRIGHTNESS_UP/DOWN command. Defined unconditionally (not under
+// NEOPIXEL_ENABLE) because Cmd.cpp dispatches that command regardless of whether LEDs are compiled in
+// -- Led_SetBrightness()/Led_GetBrightness() are always defined and simply no-op without NEOPIXEL, so
+// referencing these constants there must compile too. See issue #453.
+#define LED_BRIGHTNESS_STEP 4u // Brightness change per rotary detent (CMD_BRIGHTNESS_UP/DOWN)
+#define LED_BRIGHTNESS_MIN	1u // Never let a gesture turn the LEDs fully off -- that looks like a crash
+
 #ifdef NEOPIXEL_ENABLE
 	#define LED_INITIAL_BRIGHTNESS		 16u
-	#define LED_BRIGHTNESS_STEP			 4u // Brightness change per rotary detent (CMD_BRIGHTNESS_UP/DOWN)
-	#define LED_BRIGHTNESS_MIN			 1u // Never let a gesture turn the LEDs fully off -- that looks like a crash
 	#define LED_INITIAL_NIGHT_BRIGHTNESS 2u
 
-	#define FASTLED_ESP32_USE_CLOCKLESS_SPI 1
-
+	#pragma push_macro("BUSY")
+	#undef BUSY
 	#include <FastLED.h>
+
+	#if defined(CONFIG_IDF_TARGET_ESP32)
+		#include <platforms/esp/32/drivers/i2s_spi/bus_traits.h>
+		#define LED_USE_FASTLED_FLEX_IO 1
+	#elif defined(CONFIG_IDF_TARGET_ESP32S3)
+		#include <platforms/esp/32/drivers/lcd_spi/bus_traits.h>
+		#define LED_USE_FASTLED_FLEX_IO 1
+	#endif
+	#pragma pop_macro("BUSY")
 
 struct LedSettings {
 	uint8_t numIndicatorLeds = 24;

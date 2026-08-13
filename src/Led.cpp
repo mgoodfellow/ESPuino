@@ -152,8 +152,41 @@ bool Led_LoadSettings(LedSettings &settings) {
 }
 #endif
 
+#ifdef NEOPIXEL_ENABLE
+	#ifdef LED_USE_FASTLED_FLEX_IO
+static fl::ChannelPtr ledChannel;
+	#endif
+
+static void Led_InitStrip(CRGB *leds, uint16_t count) {
+	#ifdef LED_USE_FASTLED_FLEX_IO
+	using ConfiguredChipset = CHIPSET<LED_PIN, COLOR_ORDER>;
+	static_assert(fl::is_same<ConfiguredChipset, WS2812B<LED_PIN, COLOR_ORDER>>::value,
+		"FastLED FLEX_IO needs an explicit timing mapping for the configured CHIPSET");
+
+	fl::ChannelOptions options;
+	options.mCorrection = TypicalSMD5050;
+	options.mDitherMode = DISABLE_DITHER;
+	options.mBus = fl::Bus::FLEX_IO;
+	options.mBusWhich = 0;
+	fl::ChannelConfigOf<fl::ClocklessChipset> config(
+		fl::makeClockless<fl::TIMING_WS2812_800KHZ>(LED_PIN),
+		fl::span<CRGB>(leds, count), COLOR_ORDER, options);
+	FastLED.setExclusiveDriver<fl::Bus::FLEX_IO, 0>();
+	ledChannel = fl::Channel::create(config);
+	FastLED.add(ledChannel);
+	#else
+	FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, count).setCorrection(TypicalSMD5050);
+	#endif
+}
+#endif
+
 void Led_Init(void) {
 #ifdef NEOPIXEL_ENABLE
+	#if defined(CONFIG_IDF_TARGET_ESP32S3)
+	constexpr uint32_t ledTaskStackSize = 6144;
+	#else
+	constexpr uint32_t ledTaskStackSize = 3072;
+	#endif
 
 	if (Led_TaskHandle) {
 		// if led task is already running notify to reload settings
@@ -168,7 +201,7 @@ void Led_Init(void) {
 	xTaskCreatePinnedToCore(
 		Led_Task, /* Function to implement the task */
 		"Led_Task", /* Name of the task */
-		3072, /* Stack size in words */ // 20251015: increased to 3072 because saving of "allgemeine Einstellungen" let to restarts because of stack overflows
+		ledTaskStackSize, /* Stack size in bytes */
 		NULL, /* Task input parameter */
 		1, /* Priority of the task */
 		&Led_TaskHandle, /* Task handle. */
@@ -403,7 +436,7 @@ static void Led_Task(void *parameter) {
 	leds = new CRGB[numIndicatorLeds + numControlLeds];
 	indicator = new CRGBSet(leds, numIndicatorLeds);
 	// initialize FastLED
-	FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, numIndicatorLeds + numControlLeds).setCorrection(TypicalSMD5050);
+	Led_InitStrip(leds, numIndicatorLeds + numControlLeds);
 	FastLED.setBrightness(gLedSettings.Led_Brightness);
 	FastLED.setDither(DISABLE_DITHER);
 	FastLED.setMaxRefreshRate(200); // limit LED refresh rate to 200Hz (less likely to cause flickering)
