@@ -92,6 +92,17 @@ AnimationReturnType Animation_Speech(const bool startNewAnimation, CRGBSet &leds
 #endif
 
 #ifdef NEOPIXEL_ENABLE
+	#ifdef NUM_INDICATOR_LEDS
+static constexpr uint8_t DEFAULT_NUM_INDICATOR_LEDS = NUM_INDICATOR_LEDS;
+	#else
+static constexpr uint8_t DEFAULT_NUM_INDICATOR_LEDS = 24;
+	#endif
+	#ifdef NUM_CONTROL_LEDS
+static constexpr uint8_t DEFAULT_NUM_CONTROL_LEDS = NUM_CONTROL_LEDS;
+	#else
+static constexpr uint8_t DEFAULT_NUM_CONTROL_LEDS = 0;
+	#endif
+
 bool Led_LoadSettings(LedSettings &settings) {
 	// Get some stuff from NVS...
 	// Get initial LED-brightness from NVS
@@ -129,18 +140,17 @@ bool Led_LoadSettings(LedSettings &settings) {
 	}
 
 	// Get the number of indicator LEDs from NVS
-	settings.numIndicatorLeds = gPrefsSettings.getUChar("numIndicator", 24); // NUM_INDICATOR_LEDS
+	settings.numIndicatorLeds = gPrefsSettings.getUChar("numIndicator", DEFAULT_NUM_INDICATOR_LEDS);
 
 	// Get the number of control LEDs from NVS
-	settings.numControlLeds = gPrefsSettings.getUChar("numControl", 0); // NUM_CONTROL_LEDS
+	settings.numControlLeds = gPrefsSettings.getUChar("numControl", DEFAULT_NUM_CONTROL_LEDS);
 
 	if ((settings.numIndicatorLeds + settings.numControlLeds) == 0) {
 		// a stored total of zero leds would leave the strip driver without a
-		// buffer and the box permanently dark — fall back to the compile-time
-		// defaults (can happen when settings were saved by a build that had
-		// NEOPIXEL_ENABLE off)
-		settings.numIndicatorLeds = NUM_INDICATOR_LEDS;
-		settings.numControlLeds = NUM_CONTROL_LEDS;
+		// buffer and the box permanently dark — fall back to the profile defaults
+		// (or the stock runtime defaults when the legacy profile macros are absent).
+		settings.numIndicatorLeds = DEFAULT_NUM_INDICATOR_LEDS;
+		settings.numControlLeds = DEFAULT_NUM_CONTROL_LEDS;
 	}
 
 	// Get the number of Led idle dots from NVS
