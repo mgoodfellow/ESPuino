@@ -19,6 +19,34 @@
 #include <esp_task_wdt.h>
 
 #ifdef NEOPIXEL_ENABLE
+	// FastLED's WS2812 backends don't work on this Arduino 3.x / ESP-IDF 5.x stack:
+	// on the S3 the clockless-SPI backend claims the FSPI host and RMT5 fails; on the
+	// classic ESP32 the SPI-DMA backend aborts (ESP_ERROR_CHECK in SpiStripWs2812::
+	// waitDone) once SD + RFID already own both SPI hosts. So the strip is driven
+	// through NeoPixelBus instead — FastLED is kept only for the CRGB/CHSV math and
+	// the animation buffer. NeoPixelBus's RMT method is unusable here too (2.8.4 uses
+	// the legacy RMT driver, which aborts under the core's driver_ng), so the output
+	// method is target-specific (see Led_InitStrip): S3 -> LCD/GDMA, classic ESP32 ->
+	// the I2S peripheral 1 method (I2S0 is left for the audio path).
+	#define LED_USE_NEOPIXELBUS 1
+
+	#if defined(CONFIG_IDF_TARGET_ESP32S3)
+		#include <esp_idf_version.h>
+		#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 5, 0)
+			// IDF 5.5 removed gpio_hal_iomux_func_sel(), but NeoPixelBus (<= 2.8.4)
+			// still calls it from the S3 LCD-method header. PIN_FUNC_SELECT is the
+			// operation that function wrapped.
+			#include <soc/io_mux_reg.h>
+inline void gpio_hal_iomux_func_sel(uint32_t pin_name, uint32_t func) {
+	PIN_FUNC_SELECT(pin_name, func);
+}
+		#endif
+	#endif // CONFIG_IDF_TARGET_ESP32S3
+
+	#include <NeoPixelBus.h>
+#endif
+
+#ifdef NEOPIXEL_ENABLE
 	#define LED_INDICATOR_SET(indicator)	((Led_Indicators) |= (1u << ((uint8_t) indicator)))
 	#define LED_INDICATOR_IS_SET(indicator) (((Led_Indicators) & (1u << ((uint8_t) indicator))) > 0u)
 	#define LED_INDICATOR_CLEAR(indicator)	((Led_Indicators) &= ~(1u << ((uint8_t) indicator)))
@@ -64,6 +92,17 @@ AnimationReturnType Animation_Speech(const bool startNewAnimation, CRGBSet &leds
 #endif
 
 #ifdef NEOPIXEL_ENABLE
+	#ifdef NUM_INDICATOR_LEDS
+static constexpr uint8_t DEFAULT_NUM_INDICATOR_LEDS = NUM_INDICATOR_LEDS;
+	#else
+static constexpr uint8_t DEFAULT_NUM_INDICATOR_LEDS = 24;
+	#endif
+	#ifdef NUM_CONTROL_LEDS
+static constexpr uint8_t DEFAULT_NUM_CONTROL_LEDS = NUM_CONTROL_LEDS;
+	#else
+static constexpr uint8_t DEFAULT_NUM_CONTROL_LEDS = 0;
+	#endif
+
 bool Led_LoadSettings(LedSettings &settings) {
 	// Get some stuff from NVS...
 	// Get initial LED-brightness from NVS
@@ -101,10 +140,18 @@ bool Led_LoadSettings(LedSettings &settings) {
 	}
 
 	// Get the number of indicator LEDs from NVS
-	settings.numIndicatorLeds = gPrefsSettings.getUChar("numIndicator", 24); // NUM_INDICATOR_LEDS
+	settings.numIndicatorLeds = gPrefsSettings.getUChar("numIndicator", DEFAULT_NUM_INDICATOR_LEDS);
 
 	// Get the number of control LEDs from NVS
-	settings.numControlLeds = gPrefsSettings.getUChar("numControl", 0); // NUM_CONTROL_LEDS
+	settings.numControlLeds = gPrefsSettings.getUChar("numControl", DEFAULT_NUM_CONTROL_LEDS);
+
+	if ((settings.numIndicatorLeds + settings.numControlLeds) == 0) {
+		// a stored total of zero leds would leave the strip driver without a
+		// buffer and the box permanently dark — fall back to the profile defaults
+		// (or the stock runtime defaults when the legacy profile macros are absent).
+		settings.numIndicatorLeds = DEFAULT_NUM_INDICATOR_LEDS;
+		settings.numControlLeds = DEFAULT_NUM_CONTROL_LEDS;
+	}
 
 	// Get the number of Led idle dots from NVS
 	settings.numIdleDots = gPrefsSettings.getUChar("numIdleDots", 4); // NUM_LEDS_IDLE_DOTS
@@ -152,6 +199,80 @@ bool Led_LoadSettings(LedSettings &settings) {
 }
 #endif
 
+#ifdef NEOPIXEL_ENABLE
+	#ifdef LED_USE_NEOPIXELBUS
+// Map FastLED's COLOR_ORDER setting onto the matching NeoPixelBus feature
+template <EOrder order>
+struct NeoFeatureFor;
+
+template <>
+struct NeoFeatureFor<RGB> {
+	using type = NeoRgbFeature;
+};
+
+template <>
+struct NeoFeatureFor<GRB> {
+	using type = NeoGrbFeature;
+};
+
+		#if defined(CONFIG_IDF_TARGET_ESP32S3)
+using LedStripMethod = NeoEsp32LcdX8Ws2812xMethod; // S3: LCD/GDMA (RMT unusable; no free SPI host)
+		#else
+using LedStripMethod = NeoEsp32I2s1Ws2812xMethod; // classic ESP32: I2S peripheral 1 (I2S0 = audio)
+		#endif
+using LedStrip = NeoPixelBus<NeoFeatureFor<COLOR_ORDER>::type, LedStripMethod>;
+static LedStrip *ledStrip = nullptr;
+// Perceptual dimming: WS2812 output is ~linear in its 8-bit value but the eye is ~logarithmic,
+// so a plain linear brightness scale barely dims until the very bottom of the range. Gamma-correct
+// the (already brightness-scaled) colour in Led_ShowStrip so perceived brightness tracks the
+// setting — a wide, smooth dimming range instead of "bright until it snaps off".
+static NeoGamma<NeoGammaCieLabEquationMethod> ledGamma;
+	#endif
+
+// (Re-)initialize the LED output driver for the given total number of leds
+static void Led_InitStrip(CRGB *leds, uint16_t count) {
+	#ifdef LED_USE_NEOPIXELBUS
+	delete ledStrip; // the dtor releases the peripheral, so a re-init doesn't leak it
+	ledStrip = new LedStrip(count, LED_PIN);
+	ledStrip->Begin();
+	Log_Printf(LOGLEVEL_NOTICE, "LED: NeoPixelBus strip initialized (%u leds on GPIO %u)", count, LED_PIN);
+	#else
+	FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, count).setCorrection(TypicalSMD5050);
+	#endif
+}
+
+// Push the CRGB working buffer out to the strip
+static void Led_ShowStrip(CRGB *leds, uint16_t count) {
+	#ifdef LED_USE_NEOPIXELBUS
+	// NeoPixelBus has no global brightness or color-correction, so apply
+	// FastLED's semantics (brightness x TypicalSMD5050) per pixel here
+	const uint8_t b = gLedSettings.Led_Brightness;
+	const uint8_t scaleR = scale8(0xFF, b);
+	const uint8_t scaleG = scale8(0xB0, b);
+	const uint8_t scaleB = scale8(0xF0, b);
+	for (uint16_t i = 0; i < count; i++) {
+		const RgbColor c(scale8(leds[i].r, scaleR), scale8(leds[i].g, scaleG), scale8(leds[i].b, scaleB));
+		ledStrip->SetPixelColor(i, ledGamma.Correct(c));
+	}
+	ledStrip->Show();
+	#else
+	FastLED.show();
+	#endif
+}
+
+// Turn all leds off immediately (also called from outside the led-task)
+static void Led_ClearStrip(void) {
+	#ifdef LED_USE_NEOPIXELBUS
+	if (ledStrip) {
+		ledStrip->ClearTo(RgbColor(0));
+		ledStrip->Show();
+	}
+	#else
+	FastLED.clear(true);
+	#endif
+}
+#endif
+
 void Led_Init(void) {
 #ifdef NEOPIXEL_ENABLE
 
@@ -185,7 +306,7 @@ void Led_Exit(void) {
 		Led_TaskHandle = NULL;
 	}
 	// Turn off LEDs in order to avoid LEDs still glowing when ESP32 is in deepsleep
-	FastLED.clear(true);
+	Led_ClearStrip();
 #endif
 }
 
@@ -402,11 +523,13 @@ static void Led_Task(void *parameter) {
 	// Allocate memory for LED arrays
 	leds = new CRGB[numIndicatorLeds + numControlLeds];
 	indicator = new CRGBSet(leds, numIndicatorLeds);
-	// initialize FastLED
-	FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, numIndicatorLeds + numControlLeds).setCorrection(TypicalSMD5050);
+	// initialize the LED driver
+	Led_InitStrip(leds, numIndicatorLeds + numControlLeds);
+	#ifndef LED_USE_NEOPIXELBUS
 	FastLED.setBrightness(gLedSettings.Led_Brightness);
 	FastLED.setDither(DISABLE_DITHER);
 	FastLED.setMaxRefreshRate(200); // limit LED refresh rate to 200Hz (less likely to cause flickering)
+	#endif
 
 	LedAnimationType activeAnimation = LedAnimationType::NoNewAnimation;
 	LedAnimationType nextAnimation = LedAnimationType::NoNewAnimation;
@@ -501,7 +624,9 @@ static void Led_Task(void *parameter) {
 
 		// apply brightness-changes
 		if (lastLedBrightness != gLedSettings.Led_Brightness) {
+	#ifndef LED_USE_NEOPIXELBUS
 			FastLED.setBrightness(gLedSettings.Led_Brightness);
+	#endif
 			lastLedBrightness = gLedSettings.Led_Brightness;
 		}
 
@@ -574,7 +699,7 @@ static void Led_Task(void *parameter) {
 
 					default:
 						*indicator = CRGB::Black;
-						FastLED.show();
+						Led_ShowStrip(leds, numIndicatorLeds + numControlLeds);
 						ret.animationActive = false;
 						ret.animationDelay = 50;
 						break;
@@ -583,7 +708,7 @@ static void Led_Task(void *parameter) {
 				animationActive = ret.animationActive;
 				animationTimer = ret.animationDelay;
 				if (ret.animationRefresh) {
-					FastLED.show();
+					Led_ShowStrip(leds, numIndicatorLeds + numControlLeds);
 				}
 			}
 		} else {
@@ -596,7 +721,7 @@ static void Led_Task(void *parameter) {
 					leds[i].setHSV(gLedSettings.atmoHue, gLedSettings.atmoSaturation, 255);
 				}
 			}
-			FastLED.show();
+			Led_ShowStrip(leds, numIndicatorLeds + numControlLeds);
 			activeAnimation = LedAnimationType::NoNewAnimation;
 			animationActive = false;
 			animationTimer = 0;
@@ -1334,7 +1459,7 @@ void Led_TaskPause(void) {
 #ifdef NEOPIXEL_ENABLE
 	if (Led_TaskHandle != NULL) {
 		vTaskSuspend(Led_TaskHandle);
-		FastLED.clear(true);
+		Led_ClearStrip();
 	}
 #endif
 }
@@ -1369,13 +1494,45 @@ void Led_ShowOtaProgress(uint8_t percent) {
 			blinkOn = !blinkOn;
 		}
 		leds[0] = blinkOn ? CRGB::Blue : CRGB::Black;
-		FastLED.show();
+		Led_ShowStrip(leds, gLedSettings.numIndicatorLeds + gLedSettings.numControlLeds);
 		return;
 	}
 	const uint8_t litCount = (uint8_t) (((uint16_t) percent * gLedSettings.numIndicatorLeds) / 100);
 	for (uint8_t i = 0; i < gLedSettings.numIndicatorLeds; i++) {
 		leds[i] = (i < litCount) ? CRGB::Blue : CRGB::Black;
 	}
-	FastLED.show();
+	Led_ShowStrip(leds, gLedSettings.numIndicatorLeds + gLedSettings.numControlLeds);
+#endif
+}
+
+// Blink the whole ring red synchronously, for a fatal boot-time error (e.g. SD
+// mount failure) where the async LED task isn't drawing yet. Suspends the LED
+// task so it can't fight for the strip, (re)initializes the strip clean, then
+// blinks red in-place. Caller typically reboots afterwards.
+void Led_ShowError(uint8_t blinks) {
+#ifdef NEOPIXEL_ENABLE
+	if (Led_TaskHandle) {
+		vTaskSuspend(Led_TaskHandle);
+	}
+	#ifdef LED_USE_NEOPIXELBUS
+	delete ledStrip; // drop any (possibly half-initialized) strip, start clean
+	ledStrip = new LedStrip(gLedSettings.numIndicatorLeds + gLedSettings.numControlLeds, LED_PIN);
+	ledStrip->Begin();
+	for (uint8_t i = 0; i < blinks; i++) {
+		ledStrip->ClearTo(RgbColor(40, 0, 0)); // dim red (~16%)
+		ledStrip->Show();
+		delay(250);
+		ledStrip->ClearTo(RgbColor(0, 0, 0));
+		ledStrip->Show();
+		delay(250);
+	}
+	#else
+	for (uint8_t i = 0; i < blinks; i++) {
+		FastLED.showColor(CRGB(40, 0, 0));
+		delay(250);
+		FastLED.showColor(CRGB::Black);
+		delay(250);
+	}
+	#endif
 #endif
 }
